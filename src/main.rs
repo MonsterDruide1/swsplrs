@@ -17,5 +17,7 @@ fn main() -> anyhow::Result<()> {
     let nso = nso::NSO::new(File::open(&args.input)?)?;
 
     println!("Hello, world!");
+    println!("Input file: {}", args.input);
+    println!("NSO Header: {:#?}", nso.header);
     Ok(())
 }
