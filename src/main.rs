@@ -16,8 +16,7 @@ fn main() -> anyhow::Result<()> {
     let args: Args = argh::from_env();
     let nso = nso::NSO::new(File::open(&args.input)?)?;
 
-    println!("Hello, world!");
     println!("Input file: {}", args.input);
-    println!("NSO Header: {:#?}", nso.header);
+    nso.export_all(std::path::Path::new("out"))?;
     Ok(())
 }

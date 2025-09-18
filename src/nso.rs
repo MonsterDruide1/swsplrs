@@ -1,4 +1,4 @@
-use std::{fs::File, io::{Read, Seek, Cursor}};
+use std::{collections::HashMap, fs::{self, File}, io::{Cursor, Read, Seek}, iter::Map, path::Path};
 
 use anyhow::ensure;
 use binrw::{binread, BinRead, BinReaderExt, NullString};
@@ -15,9 +15,10 @@ pub struct NSO {
     pub build_str: BuildStr,
     pub symbol_table: Vec<DynamicSymbol>,
     pub module: Module,
+    pub dynamic_segment: Vec<(DynamicTagType, u64)>,
     pub reloc_dyn_table: Vec<Relocation>,
     pub reloc_plt_table: Vec<Relocation>,
-    pub dynstr_table: Vec<String>,
+    pub dynstr_table: HashMap<u64, String>,
     pub global_plt: Vec<u64>,
 }
 
@@ -58,11 +59,19 @@ impl NSO {
             build_str,
             symbol_table,
             module,
+            dynamic_segment,
             reloc_dyn_table,
             reloc_plt_table,
             dynstr_table,
             global_plt,
         })
+    }
+
+    pub fn export_all(self, path: &Path) -> anyhow::Result<()> {
+        fs::create_dir_all(path)?;
+        self.export_got_plt(path.join("got.plt.s"))?;
+        //export_got(path.join("got.s"))?;
+        Ok(())
     }
 
     fn read_segment(segment: &NsoSegment, file: &mut File, header: &NsoHeader) -> anyhow::Result<Vec<u8>> {
@@ -139,15 +148,15 @@ impl NSO {
         Ok(relocations)
     }
 
-    fn parse_dynamic_string_table(rodata_segment: &[u8], dynstr_offset: u32, dynstr_size: u32) -> anyhow::Result<Vec<String>> {
+    fn parse_dynamic_string_table(rodata_segment: &[u8], dynstr_offset: u32, dynstr_size: u32) -> anyhow::Result<HashMap<u64, String>> {
         let str_data = &rodata_segment[dynstr_offset as usize .. (dynstr_offset + dynstr_size) as usize];
         let mut cursor = Cursor::new(str_data);
-        let mut strings = Vec::new();
+        let mut strings = HashMap::new();
         loop {
             if cursor.position() as usize >= str_data.len() {
                 break;
             }
-            strings.push(cursor.read_le::<NullString>()?.to_string());
+            strings.insert(cursor.position(), cursor.read_le::<NullString>()?.to_string());
         }
         Ok(strings)
     }
@@ -161,6 +170,36 @@ impl NSO {
             plt_entries.push(entry);
         }
         Ok(plt_entries)
+    }
+
+    fn export_got_plt(self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \".got.plt\"")?;
+        writeln!(file, "")?;
+
+        let mut got_plt_mem_offset = Self::get_dynamic_tag_value(&self.dynamic_segment, DynamicTagType::DT_PLTGOT)?;
+
+        for _ in 0..3 {
+            writeln!(file, ".global off_{:X}", got_plt_mem_offset)?;
+            writeln!(file, "off_{:X}:", got_plt_mem_offset)?;
+            writeln!(file, "\t.quad 0")?;
+            writeln!(file, "")?;
+            got_plt_mem_offset += 8;
+        }
+
+        for i in 0..self.global_plt.len() {
+            let entry = &self.reloc_plt_table[i];
+            let sym = &self.symbol_table[entry.sym_idx as usize];
+            let name = &self.dynstr_table[&(sym.str_table_offset as u64)];
+            writeln!(file, ".global off_{:X}", got_plt_mem_offset)?;
+            writeln!(file, "off_{:X}:", got_plt_mem_offset)?;
+            writeln!(file, "\t.quad {}", name)?;
+            writeln!(file, "")?;
+            got_plt_mem_offset += 8;
+        }
+
+        Ok(())
     }
 }
 
