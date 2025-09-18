@@ -79,6 +79,10 @@ impl NSO {
         fs::create_dir_all(path)?;
         let helper = NsoLookupHelper::new(self)?;
 
+        let mut ref_types = HashMap::<u64, DataRefType>::new();
+        ref_types.extend(self.ref_types_got_plt()?);
+        ref_types.extend(self.ref_types_got(&helper)?);
+
         self.export_got_plt(path.join("got.plt.s"))?;
         self.export_got(path.join("got.s"), &helper)?;
         Ok(())
@@ -250,6 +254,32 @@ impl NSO {
         }
 
         Ok(())
+    }
+
+    fn ref_types_got_plt(&self) -> anyhow::Result<HashMap<u64, DataRefType>> {
+        Ok(HashMap::new())
+    }
+
+    fn ref_types_got(&self, helper: &NsoLookupHelper) -> anyhow::Result<HashMap<u64, DataRefType>> {
+        let mut ref_types = HashMap::new();
+
+        for i in 0..self.got_metadata.count {
+            let got_entry_offset = self.got_metadata.start_offset + i * 8;
+            let Some(entry_index) = helper.reloc_dyn_addr_to_idx.get(&got_entry_offset) else {
+                continue;
+            };
+            let entry = &self.reloc_dyn_table[*entry_index];
+
+            match entry.reloc_type {
+                RelocationType::R_AARCH64_GLOB_DAT | RelocationType::R_AARCH64_ABS64 => {}
+                RelocationType::R_AARCH64_RELATIVE => {
+                    ref_types.insert(entry.addend as u64, DataRefType::Qword);
+                }
+                _ => bail!("Unsupported relocation type {:?} in .got", entry.reloc_type),
+            }
+        }
+
+        Ok(ref_types)
     }
 }
 
@@ -439,4 +469,12 @@ impl NsoLookupHelper {
 
         Ok(Self { reloc_dyn_addr_to_idx, symbol_table_value_to_idx })
     }
+}
+
+enum DataRefType {
+    Byte,
+    Word,
+    Qword,
+    Xword,
+    Single,
 }
