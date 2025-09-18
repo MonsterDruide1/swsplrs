@@ -1,6 +1,6 @@
-use std::{collections::HashMap, fs::{self, File}, io::{Cursor, Read, Seek}, iter::Map, path::Path};
+use std::{collections::HashMap, fs::{self, File}, io::{Cursor, Read, Seek}, path::Path};
 
-use anyhow::ensure;
+use anyhow::{bail, ensure};
 use binrw::{binread, BinRead, BinReaderExt, NullString};
 use num_enum::TryFromPrimitive;
 use sha2::{Digest, Sha256};
@@ -20,6 +20,7 @@ pub struct NSO {
     pub reloc_plt_table: Vec<Relocation>,
     pub dynstr_table: HashMap<u64, String>,
     pub global_plt: Vec<u64>,
+    pub got_metadata: GotMetadata,
 }
 
 impl NSO {
@@ -33,8 +34,9 @@ impl NSO {
         let build_str = BuildStr::new(&rodata_segment)?;
         let symbol_table = Self::parse_dynamic_symbols(&rodata_segment, header.dynsym_offset, header.dynsym_size)?;
         let module = Module::read_le(&mut Cursor::new(&text_segment))?;
+        let dynamic_offset = (module.header_offset + module.dyn_offset - header.get_segment_mem_offset(&NsoSegment::Data)) as usize;
         let dynamic_segment = Self::parse_dynamic_section(
-            &data_segment[ (module.header_offset + module.dyn_offset - header.get_segment_mem_offset(&NsoSegment::Data)) as usize ..]
+            &data_segment[dynamic_offset..]
         )?;
         // skip .hash and .gnu_hash for now
         let reloc_dyn_table = Self::parse_reloc_table(
@@ -47,9 +49,14 @@ impl NSO {
         )?;
         let dynstr_table = Self::parse_dynamic_string_table(&rodata_segment, header.dynstr_offset, header.dynstr_size)?;
         let global_plt = Self::parse_global_plt(
-            &rodata_segment[dynamic_segment.len()*16 .. ],
+            &data_segment[dynamic_offset + dynamic_segment.len()*0x18 .. ],
             reloc_plt_table.iter().filter(|r| r.reloc_type == RelocationType::R_AARCH64_JUMP_SLOT).count()
         )?;
+        let got_start_offset = dynamic_offset as u64 + dynamic_segment.len() as u64*0x10+0x10 + 0x18+global_plt.len() as u64*8 + header.get_segment_mem_offset(&NsoSegment::Data) as u64;
+        let got_metadata = GotMetadata {
+            start_offset: got_start_offset,
+            count: (Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_INIT_ARRAY)? - got_start_offset) / 8,
+        };
 
         Ok(NSO {
             header,
@@ -64,13 +71,16 @@ impl NSO {
             reloc_plt_table,
             dynstr_table,
             global_plt,
+            got_metadata,
         })
     }
 
-    pub fn export_all(self, path: &Path) -> anyhow::Result<()> {
+    pub fn export_all(&self, path: &Path) -> anyhow::Result<()> {
         fs::create_dir_all(path)?;
+        let helper = NsoLookupHelper::new(self)?;
+
         self.export_got_plt(path.join("got.plt.s"))?;
-        //export_got(path.join("got.s"))?;
+        self.export_got(path.join("got.s"), &helper)?;
         Ok(())
     }
 
@@ -172,7 +182,7 @@ impl NSO {
         Ok(plt_entries)
     }
 
-    fn export_got_plt(self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+    fn export_got_plt(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
         writeln!(file, ".section \".got.plt\"")?;
@@ -197,6 +207,46 @@ impl NSO {
             writeln!(file, "\t.quad {}", name)?;
             writeln!(file, "")?;
             got_plt_mem_offset += 8;
+        }
+
+        Ok(())
+    }
+
+    fn export_got(&self, path: impl AsRef<Path>, helper: &NsoLookupHelper) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \".got\"")?;
+        writeln!(file, "")?;
+
+        for i in 0..self.got_metadata.count {
+            let got_entry_offset = self.got_metadata.start_offset + i * 8;
+            writeln!(file, ".global off_{:X}", got_entry_offset)?;
+            writeln!(file, "off_{:X}:", got_entry_offset)?;
+
+            let Some(entry_index) = helper.reloc_dyn_addr_to_idx.get(&got_entry_offset) else {
+                writeln!(file, "")?;
+                continue;
+            };
+            let entry = &self.reloc_dyn_table[*entry_index];
+
+            match entry.reloc_type {
+                RelocationType::R_AARCH64_GLOB_DAT | RelocationType::R_AARCH64_ABS64 => {
+                    let sym = &self.symbol_table[entry.sym_idx as usize];
+                    let name = &self.dynstr_table[&(sym.str_table_offset as u64)];
+                    writeln!(file, "\t.quad {}", name)?;
+                }
+                RelocationType::R_AARCH64_RELATIVE => {
+                    let name = if let Some(sym_idx) = helper.symbol_table_value_to_idx.get(&(entry.addend as u64)) {
+                        let sym = &self.symbol_table[*sym_idx];
+                        &self.dynstr_table[&(sym.str_table_offset as u64)]
+                    } else {
+                        &format!("off_{:X}", entry.addend)
+                    };
+                    writeln!(file, "\t.quad {}", name)?;
+                }
+                _ => bail!("Unsupported relocation type {:?} in .got", entry.reloc_type),
+            }
+            writeln!(file, "")?;
         }
 
         Ok(())
@@ -363,4 +413,30 @@ pub enum RelocationType {
     R_AARCH64_TLS_DTPREL32 = 1031,
     R_AARCH64_IRELATIVE = 1032,
     R_AARCH64_ABS64 = 257
+}
+
+#[derive(Debug)]
+pub struct GotMetadata {
+    pub start_offset: u64,
+    pub count: u64,
+}
+
+
+
+struct NsoLookupHelper {
+    reloc_dyn_addr_to_idx: HashMap<u64, usize>,
+    symbol_table_value_to_idx: HashMap<u64, usize>,
+}
+impl NsoLookupHelper {
+    pub fn new(nso: &NSO) -> anyhow::Result<Self> {
+        let reloc_dyn_addr_to_idx = nso.reloc_dyn_table.iter().enumerate().map(|(i,r)| (r.offset, i)).collect::<HashMap<_, _>>();
+        ensure!(reloc_dyn_addr_to_idx.len() == nso.reloc_dyn_table.len(), "Duplicate entries in .rela.dyn");
+
+        let symbol_table_value_to_idx = nso.symbol_table.iter().enumerate().map(|(i, sym)| (sym.value, i)).collect::<HashMap<_, _>>();
+        if symbol_table_value_to_idx.len() != nso.symbol_table.len() {
+            println!("Warning: {} duplicate symbol values in symbol table. Using last one when lookups are done.", nso.symbol_table.len() - symbol_table_value_to_idx.len());
+        }
+
+        Ok(Self { reloc_dyn_addr_to_idx, symbol_table_value_to_idx })
+    }
 }
