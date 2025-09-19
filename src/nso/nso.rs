@@ -85,7 +85,7 @@ impl NSO {
         let mut ref_types = HashMap::<u64, DataRefType>::new();
         ref_types.extend(self.ref_types_got_plt()?);
         ref_types.extend(self.ref_types_got(&helper)?);
-        ref_types.extend(self.file.text.collect_references_old()?);
+        ref_types.extend(self.file.text.collect_references()?);
 
         self.export_got_plt(path.join("got.plt.s"))?;
         self.export_got(path.join("got.s"), &helper)?;
@@ -255,6 +255,7 @@ impl NSO {
     }
 
     fn ref_types_got_plt(&self) -> anyhow::Result<HashMap<u64, DataRefType>> {
+        // .got.plt only references functions outside of this binary
         Ok(HashMap::new())
     }
 
@@ -271,7 +272,7 @@ impl NSO {
             match entry.reloc_type {
                 RelocationType::R_AARCH64_GLOB_DAT | RelocationType::R_AARCH64_ABS64 => {}
                 RelocationType::R_AARCH64_RELATIVE => {
-                    ref_types.insert(entry.addend as u64, DataRefType::Qword);
+                    ref_types.insert(entry.addend as u64, DataRefType::Int64);
                 }
                 _ => bail!("Unsupported relocation type {:?} in .got", entry.reloc_type),
             }
@@ -440,11 +441,14 @@ impl NsoLookupHelper {
     }
 }
 
+#[derive(Debug)]
 pub enum DataRefType {
-    Byte,
-    Word,
-    Qword,
-    Xword,
-    Single,
+    Int32,
+    Int64,
+    Float8,
+    Float16,
+    Float32,
+    Float64,
+    Float128,
     Code,
 }

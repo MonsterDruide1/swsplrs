@@ -1,8 +1,8 @@
-use std::{collections::HashMap, io::Cursor};
+use std::{collections::{HashMap, HashSet}, io::Cursor, u64};
 
 use anyhow::{bail, ensure};
 use binrw::{binread, BinRead};
-use capstone::{self, arch::{arm64::{Arm64Operand, Arm64OperandType}, ArchOperand, BuildsCapstone, BuildsCapstoneEndian}, InsnGroupId};
+use capstone::{self, arch::{arm64::{Arm64Operand, Arm64OperandType}, ArchOperand, BuildsCapstone, BuildsCapstoneEndian}, InsnGroupId, RegId};
 
 use crate::nso::nso::DataRefType;
 
@@ -19,6 +19,156 @@ impl TextSegment {
         let section = text[section_offset..].to_vec();
 
         Self { module, section, section_offset }
+    }
+
+    pub fn collect_references(&self) -> anyhow::Result<HashMap<u64, DataRefType>> {
+        let mut ref_types: HashMap<u64, DataRefType> = HashMap::new();
+        let cs = construct_capstone()?;
+
+        struct PotentialRef {
+            register: capstone::RegId,
+            offset: u64,
+            ref_type: DataRefType,
+        }
+        struct BasicBlock {
+            start: u64,  // address of first instruction in the block
+            end: u64,  // address of last instruction within block + 4
+            next_blocks: Vec<u64>,
+            adrp_targets_at_end: HashMap<capstone::RegId, u64>,
+            destroyed_regs: HashSet<capstone::RegId>,
+            potential_refs: Vec<PotentialRef>,
+        }
+        let mut blocks = Vec::<BasicBlock>::new();
+        
+        let mut iter = cs.disasm_iter(&self.section, self.section_offset as u64)
+            .or_else(|e| bail!("Failed to disassemble text segment: {}", e))?;
+        
+        let mut current_block = BasicBlock {
+            start: self.section_offset as u64,
+            end: u64::MAX,
+            next_blocks: Vec::new(),
+            adrp_targets_at_end: HashMap::new(),
+            destroyed_regs: HashSet::new(),
+            potential_refs: Vec::new(),
+        };
+        let mut finish_basic_block = |mut block: BasicBlock, instr_addr: u64, next_blocks: Vec<u64>| {
+            let next_block_addr = instr_addr + 4;
+            block.end = next_block_addr;  // final instruction is inclusive
+            block.next_blocks = next_blocks;
+            blocks.push(block);
+            BasicBlock {
+                start: next_block_addr,
+                end: u64::MAX,
+                next_blocks: Vec::new(),
+                adrp_targets_at_end: HashMap::new(),
+                destroyed_regs: HashSet::new(),
+                potential_refs: Vec::new(),
+            }
+        };
+        let handle_potential_ref = |mut block: BasicBlock, src_reg: RegId, offset: u64, ref_type: DataRefType, ref_types: &mut HashMap<u64, DataRefType>| {
+            if let Some(base) = block.adrp_targets_at_end.get(&src_reg) {
+                ref_types.insert(base + offset, ref_type);
+            } else if !block.destroyed_regs.contains(&src_reg) {
+                block.potential_refs.push(PotentialRef {
+                    register: src_reg,
+                    offset,
+                    ref_type,
+                });
+            }  // else: base register has been re-assigned to "useless" value within this block => ignore
+            block
+        };
+
+        while let Some(instr) = iter.next() {
+            let Some(mnemonic) = instr.mnemonic() else {
+                bail!("Instruction at 0x{:X} has no mnemonic", instr.address());
+            };
+            if mnemonic == ".byte" {
+                continue; // expected for TRAP instructions = 0xE7FFDEFE
+            }
+            let detail = cs.insn_detail(&instr)
+                .or_else(|e| bail!("Failed to get instruction detail: {}", e))?;
+            current_block.destroyed_regs.extend(detail.regs_write());
+            current_block.adrp_targets_at_end.retain(|reg, _| !detail.regs_write().contains(reg));
+
+            // TODO: clear scratch registers on function calls (bl, blr)
+            match mnemonic {
+                // branching/jumps/calls
+                "blr" => {}  // resolved at runtime, ignore
+                "br" => {
+                    current_block = finish_basic_block(current_block, instr.address(), vec![]);
+                }
+                "bl" => {
+                    ref_types.insert(get_operand_imm(&detail, 0)?, DataRefType::Code);
+                }
+                "b" => {
+                    let target = get_operand_imm(&detail, 0)?;
+                    ref_types.insert(target, DataRefType::Code);
+                    current_block = finish_basic_block(current_block, instr.address(), vec![target]);
+                }
+                "tbz" | "tbnz" => {
+                    let target = get_operand_imm(&detail, 2)?;
+                    ref_types.insert(target, DataRefType::Code);
+                    current_block = finish_basic_block(current_block, instr.address(), vec![target, instr.address()+4]);
+                }
+                "cbz" | "cbnz" => {
+                    let target = get_operand_imm(&detail, 1)?;
+                    ref_types.insert(target, DataRefType::Code);
+                    current_block = finish_basic_block(current_block, instr.address(), vec![target, instr.address()+4]);
+                }
+                s if s.starts_with("b.") => {  // conditionals with b (b.eq, b.ne, b.lt, ...)
+                    let target = get_operand_imm(&detail, 0)?;
+                    ref_types.insert(target, DataRefType::Code);
+                    current_block = finish_basic_block(current_block, instr.address(), vec![target, instr.address()+4]);
+                }
+
+                // loads/stores
+                "adr" => {bail!("Unhandled adr instruction at 0x{:X}", instr.address());}
+                "adrp" => {
+                    current_block.adrp_targets_at_end.insert(get_operand_reg(&detail, 0)?, get_operand_imm(&detail, 1)?);
+                }
+                "add" => {
+                    // we are only interested in adds with last operand being an immediate (=> offset)
+                    if let Ok(offset) = get_operand_imm(&detail, 2) {
+                        current_block = handle_potential_ref(
+                            current_block,
+                            get_operand_reg(&detail, 1)?,
+                            offset,
+                            get_reg_type(get_operand_reg(&detail, 0)?, &cs)?,
+                            &mut ref_types
+                        );
+                    }
+                }
+                "ldr" | "str" | "ldrh" | "strh" | "ldrb" | "strb" | "ldrsh" => {
+                    current_block = handle_potential_ref(
+                        current_block,
+                        get_operand_mem(&detail, 1)?.base(),
+                        get_operand_mem(&detail, 1)?.disp() as u64,
+                        get_reg_type(get_operand_reg(&detail, 0)?, &cs)?,
+                        &mut ref_types
+                    );
+                }
+                _ => {
+                    ensure!(
+                        !detail.groups().contains(&InsnGroupId(capstone::arch::arm64::Arm64InsnGroup::ARM64_GRP_JUMP as u8)),
+                        "Unhandled jump instruction mnemonic: {} at 0x{:X}", mnemonic, instr.address()
+                    );
+                    ensure!(
+                        !detail.groups().contains(&InsnGroupId(capstone::arch::arm64::Arm64InsnGroup::ARM64_GRP_CALL as u8)),
+                        "Unhandled call instruction mnemonic: {} at 0x{:X}", mnemonic, instr.address()
+                    );
+                    //println!("Unhandled instruction mnemonic: {} at 0x{:X}", mnemonic, instr.address());
+                }
+            }
+        }
+
+        println!("Constructed {} basic blocks", blocks.len());
+        for i in 0..10 {
+            println!("Block {}: start=0x{:X}, end=0x{:X}, next={:?}, adrp_targets={:?}, destroyed_regs={:?}, potential_refs={}",
+                i, blocks[i].start, blocks[i].end, blocks[i].next_blocks, blocks[i].adrp_targets_at_end, blocks[i].destroyed_regs,
+                blocks[i].potential_refs.iter().map(|r| format!("(reg: {:?}, offset: 0x{:X}, type: {:?})", r.register, r.offset, r.ref_type)).collect::<Vec<String>>().join(", "));
+        }
+        // TODO: global analysis, passing around adrp between basic blocks
+        Ok(ref_types)
     }
 
     pub fn collect_references_old(&self) -> anyhow::Result<HashMap<u64, DataRefType>> {
@@ -206,12 +356,19 @@ fn get_operand_mem(detail: &capstone::InsnDetail, idx: usize) -> anyhow::Result<
 fn get_reg_type(reg: capstone::RegId, cs: &capstone::Capstone) -> anyhow::Result<DataRefType> {
     let name = cs.reg_name(reg)
         .ok_or_else(|| anyhow::anyhow!("Failed to get register name for {:?}", reg))?;
+    if name == "fp" {  // frame pointer = x29
+        return Ok(DataRefType::Int64);
+    } else if name == "lr" {  // link register = x30
+        return Ok(DataRefType::Int64);
+    }
     match name[0..1].as_ref() {
-        "w" => Ok(DataRefType::Word),    // 32-bit integer
-        "x" => Ok(DataRefType::Qword),   // 64-bit integer
-        "s" => Ok(DataRefType::Single),  // 32-bit floating point
-        "d" => Ok(DataRefType::Qword),   // 64-bit floating point
-        "q" => Ok(DataRefType::Xword),   // 128-bit floating point
+        "w" => Ok(DataRefType::Int32),
+        "x" => Ok(DataRefType::Int64),
+        "b" => Ok(DataRefType::Float8),
+        "h" => Ok(DataRefType::Float16),
+        "s" => Ok(DataRefType::Float32),
+        "d" => Ok(DataRefType::Float64),
+        "q" => Ok(DataRefType::Float128),
         _ => bail!("Unsupported register name: {}", name),
     }
 }
