@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.99"
 argh = "0.1.13"
 binrw = "0.15.0"
+capstone = { git = "https://github.com/capstone-rust/capstone-rs", rev = "85534a97ca7b5f8cc0abe2fea4d42fded803214d" }
 lz4_flex = "0.11.5"
 num_enum = "0.7.4"
 sha2 = "0.10.9"
