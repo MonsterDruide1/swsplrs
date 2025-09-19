@@ -1,19 +1,16 @@
 use std::{collections::HashMap, fs::{self, File}, io::{Cursor, Read, Seek}, path::Path};
 
-use anyhow::{bail, ensure};
+use anyhow::{bail, ensure, Result};
 use binrw::{binread, BinRead, BinReaderExt, NullString};
 use num_enum::TryFromPrimitive;
 use sha2::{Digest, Sha256};
 use capstone::{self, arch::{arm64::{Arm64Operand, Arm64OperandType}, ArchOperand, BuildsCapstone, BuildsCapstoneEndian}, InsnGroupId};
 
-use crate::nso_header::{NsoHeader, NsoSegment};
+use crate::nso::{nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}};
 
 pub struct NSO {
-    pub header: NsoHeader,
-    pub text_segment: Vec<u8>,
-    pub rodata_segment: Vec<u8>,
-    pub data_segment: Vec<u8>,
-    pub build_str: BuildStr,
+    pub file: NsoFile,
+    pub build_str: String,
     pub symbol_table: Vec<DynamicSymbol>,
     pub module: Module,
     pub dynamic_segment: Vec<(DynamicTagType, u64)>,
@@ -25,45 +22,58 @@ pub struct NSO {
 }
 
 impl NSO {
-    pub fn new(mut file: File) -> anyhow::Result<Self> {
-        let header = NsoHeader::read(&mut file)?;
+    pub fn new(file: NsoFile) -> anyhow::Result<Self> {
+        let mut text = Cursor::new(&file.text_segment);
+        let mut rodata = Cursor::new(&file.rodata_segment);
+        let mut data = Cursor::new(&file.data_segment);
 
-        let text_segment = Self::read_segment(&NsoSegment::Text, &mut file, &header)?;
-        let rodata_segment = Self::read_segment(&NsoSegment::Rodata, &mut file, &header)?;
-        let data_segment = Self::read_segment(&NsoSegment::Data, &mut file, &header)?;
+        // .buildstr
+        let build_str = Self::parse_buildstr(&mut rodata)?;
 
-        let build_str = BuildStr::new(&rodata_segment)?;
-        let symbol_table = Self::parse_dynamic_symbols(&rodata_segment, header.dynsym_offset, header.dynsym_size)?;
-        let module = Module::read_le(&mut Cursor::new(&text_segment))?;
-        let dynamic_offset = (module.header_offset + module.dyn_offset - header.get_segment_mem_offset(&NsoSegment::Data)) as usize;
+        // .dynsym
+        let symbol_table = Self::parse_dynamic_symbols(&file.rodata_segment, file.header.dynsym_offset, file.header.dynsym_size)?;
+
+        // MOD0 (before .text)
+        let module = Module::read_le(&mut text)?;
+
+        // .dynamic
+        let dynamic_offset = (module.header_offset + module.dyn_offset - file.header.get_segment_mem_offset(&NsoSegment::Data)) as usize;
         let dynamic_segment = Self::parse_dynamic_section(
-            &data_segment[dynamic_offset..]
+            &file.data_segment[dynamic_offset..]
         )?;
+
         // skip .hash and .gnu_hash for now
+
+        // .rela.dyn
         let reloc_dyn_table = Self::parse_reloc_table(
-            &rodata_segment, &dynamic_segment, DynamicTagType::DT_RELA,
-            DynamicTagType::DT_RELASZ, &header
+            &file.rodata_segment, &dynamic_segment, DynamicTagType::DT_RELA,
+            DynamicTagType::DT_RELASZ, &file.header
         )?;
+
+        // .rela.plt
         let reloc_plt_table = Self::parse_reloc_table(
-            &rodata_segment, &dynamic_segment, DynamicTagType::DT_JMPREL,
-            DynamicTagType::DT_PLTRELSZ, &header
+            &file.rodata_segment, &dynamic_segment, DynamicTagType::DT_JMPREL,
+            DynamicTagType::DT_PLTRELSZ, &file.header
         )?;
-        let dynstr_table = Self::parse_dynamic_string_table(&rodata_segment, header.dynstr_offset, header.dynstr_size)?;
+
+        // .dynstr
+        let dynstr_table = Self::parse_dynamic_string_table(&file.rodata_segment, file.header.dynstr_offset, file.header.dynstr_size)?;
+        
+        // .got.plt
         let global_plt = Self::parse_global_plt(
-            &data_segment[dynamic_offset + dynamic_segment.len()*0x18 .. ],
+            &file.data_segment[dynamic_offset + dynamic_segment.len()*0x18 .. ],
             reloc_plt_table.iter().filter(|r| r.reloc_type == RelocationType::R_AARCH64_JUMP_SLOT).count()
         )?;
-        let got_start_offset = dynamic_offset as u64 + dynamic_segment.len() as u64*0x10+0x10 + 0x18+global_plt.len() as u64*8 + header.get_segment_mem_offset(&NsoSegment::Data) as u64;
+
+        // .got
+        let got_start_offset = dynamic_offset as u64 + dynamic_segment.len() as u64*0x10+0x10 + 0x18+global_plt.len() as u64*8 + file.header.get_segment_mem_offset(&NsoSegment::Data) as u64;
         let got_metadata = GotMetadata {
             start_offset: got_start_offset,
             count: (Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_INIT_ARRAY)? - got_start_offset) / 8,
         };
 
         Ok(NSO {
-            header,
-            text_segment,
-            rodata_segment,
-            data_segment,
+            file,
             build_str,
             symbol_table,
             module,
@@ -90,21 +100,15 @@ impl NSO {
         Ok(())
     }
 
-    fn read_segment(segment: &NsoSegment, file: &mut File, header: &NsoHeader) -> anyhow::Result<Vec<u8>> {
-        file.seek(std::io::SeekFrom::Start(header.get_segment_file_offset(segment) as u64))?;
-        let mut buffer = vec![0; header.get_segment_compressed_size(segment) as usize];
-        file.read_exact(&mut buffer)?;
+    fn parse_buildstr(data: &mut Cursor<&Vec<u8>>) -> Result<String> {
+        let zeros: [u8; 4] = data.read_le()?;
+        ensure!(zeros == [0u8; 4], ".buildstr does not start with 4 null bytes");
 
-        if header.is_segment_compressed(segment) {
-            let mut decompressed = vec![0; header.get_segment_uncompressed_size(segment) as usize];
-            let size = lz4_flex::decompress_into(&buffer, &mut decompressed)?;
-            ensure!(size == decompressed.len(), "Decompressed size does not match expected size");
-            buffer = decompressed;
-        }
+        let len: u32 = data.read_le()?;
+        let build_str: NullString = data.read_le()?;
+        ensure!(build_str.len() as u32 == len, ".buildstr length does not match");
 
-        ensure!(Sha256::digest(&buffer).as_slice() == header.get_segment_hash(segment), "Segment hash does not match expected hash");
-
-        Ok(buffer)
+        Ok(build_str.to_string())
     }
 
     fn parse_dynamic_symbols(rodata_segment: &[u8], dynsym_offset: u32, dynsym_size: u32) -> anyhow::Result<Vec<DynamicSymbol>> {
@@ -298,7 +302,7 @@ impl NSO {
             .or_else(|e| bail!("Failed to enable skipdata: {}", e))?;
 
         // FIXME: skip MOD0 section dynamically
-        let mut x = cs.disasm_iter(&self.text_segment[0x24..], 0x24)
+        let mut x = cs.disasm_iter(&self.file.text_segment[0x24..], 0x24)
             .or_else(|e| bail!("Failed to disassemble text segment: {}", e))?;
 
         fn get_operand_imm(detail: &capstone::InsnDetail, idx: usize) -> anyhow::Result<u64> {
@@ -455,18 +459,6 @@ impl NSO {
         println!("Register offset mapping history (most recent last): {}", reg_offsets_history.len());
 
         Ok(ref_types)
-    }
-}
-
-#[derive(Debug)]
-pub struct BuildStr {
-    pub build_str: String,
-}
-impl BuildStr {
-    pub fn new(rodata_segment: &[u8]) -> anyhow::Result<Self> {
-        let len = u32::from_le_bytes(rodata_segment[4..8].try_into()?) as usize;
-        let build_str = String::from_utf8(rodata_segment[8..8 + len].to_vec())?;
-        Ok(BuildStr { build_str })
     }
 }
 

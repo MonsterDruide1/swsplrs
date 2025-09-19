@@ -1,5 +1,5 @@
-mod nso_header;
 mod nso;
+use crate::nso::{nso::NSO, nso_file::NsoFile};
 
 use argh::FromArgs;
 use std::fs::File;
@@ -14,7 +14,7 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args: Args = argh::from_env();
-    let nso = nso::NSO::new(File::open(&args.input)?)?;
+    let nso = NSO::new(NsoFile::new(File::open(&args.input)?)?)?;
 
     println!("Input file: {}", args.input);
     nso.export_all(std::path::Path::new("out"))?;

@@ -20,8 +20,9 @@ struct NsoSegmentMetadata {
 #[derive(Debug)]
 #[br(little, magic = b"NSO0")]
 pub struct NsoHeader {
-    pub version: u32,
-    #[br(temp)]
+    #[br(temp, assert(version == 0))]
+    version: u32,
+    #[br(temp, assert(_8 == 0))]
     _8: u32,
     pub flags: u32,
 
@@ -35,7 +36,7 @@ pub struct NsoHeader {
     rodata_compressed_size: u32,
     data_compressed_size: u32,
 
-    #[br(temp)]
+    #[br(temp, assert(_6c == [0; 0x1c]))]
     _6c: [u8; 0x1c],
 
     pub embed_offset: u32,
@@ -61,20 +62,6 @@ impl NsoHeader {
         };
         self.flags & mask != 0
     }
-    pub fn get_segment_uncompressed_size(&self, segment: &NsoSegment) -> u32 {
-        match segment {
-            NsoSegment::Text => self.text_segment.mem_size,
-            NsoSegment::Rodata => self.rodata_segment.mem_size,
-            NsoSegment::Data => self.data_segment.mem_size,
-        }
-    }
-    pub fn get_segment_compressed_size(&self, segment: &NsoSegment) -> u32 {
-        match segment {
-            NsoSegment::Text => self.text_compressed_size,
-            NsoSegment::Rodata => self.rodata_compressed_size,
-            NsoSegment::Data => self.data_compressed_size,
-        }
-    }
     pub fn get_segment_file_offset(&self, segment: &NsoSegment) -> u32 {
         match segment {
             NsoSegment::Text => self.text_segment.file_offset,
@@ -82,11 +69,25 @@ impl NsoHeader {
             NsoSegment::Data => self.data_segment.file_offset,
         }
     }
+    pub fn get_segment_file_size(&self, segment: &NsoSegment) -> u32 {
+        match segment {
+            NsoSegment::Text => self.text_compressed_size,
+            NsoSegment::Rodata => self.rodata_compressed_size,
+            NsoSegment::Data => self.data_compressed_size,
+        }
+    }
     pub fn get_segment_mem_offset(&self, segment: &NsoSegment) -> u32 {
         match segment {
             NsoSegment::Text => self.text_segment.mem_offset,
             NsoSegment::Rodata => self.rodata_segment.mem_offset,
             NsoSegment::Data => self.data_segment.mem_offset,
+        }
+    }
+    pub fn get_segment_mem_size(&self, segment: &NsoSegment) -> u32 {
+        match segment {
+            NsoSegment::Text => self.text_segment.mem_size,
+            NsoSegment::Rodata => self.rodata_segment.mem_size,
+            NsoSegment::Data => self.data_segment.mem_size,
         }
     }
     pub fn get_segment_hash(&self, segment: &NsoSegment) -> &[u8; 0x20] {
