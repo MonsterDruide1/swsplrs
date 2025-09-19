@@ -4,11 +4,11 @@ use anyhow::{ensure, Result};
 use binrw::BinRead;
 use sha2::{Digest, Sha256};
 
-use crate::nso::nso_header::{NsoHeader, NsoSegment};
+use crate::nso::{nso_header::{NsoHeader, NsoSegment}, text::TextSegment};
 
 pub struct NsoFile {
     pub header: NsoHeader,
-    pub text_segment: Vec<u8>,
+    pub text: TextSegment,
     pub rodata_segment: Vec<u8>,
     pub data_segment: Vec<u8>,
 }
@@ -25,9 +25,11 @@ impl NsoFile {
                 file.stream_position()?, file.metadata()?.len());
         }
 
+        let text = TextSegment::new(&text_segment);
+
         Ok(Self {
             header,
-            text_segment,
+            text,
             rodata_segment,
             data_segment,
         })
