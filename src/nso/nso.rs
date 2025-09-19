@@ -81,11 +81,11 @@ impl NSO {
     pub fn export_all(&self, path: &Path) -> anyhow::Result<()> {
         fs::create_dir_all(path)?;
         let helper = NsoLookupHelper::new(self)?;
+        let mut reference_tracker = ReferenceTracker::new();
 
-        let mut ref_types = HashMap::<u64, DataRefType>::new();
-        ref_types.extend(self.ref_types_got_plt()?);
-        ref_types.extend(self.ref_types_got(&helper)?);
-        ref_types.extend(self.file.text.collect_references()?);
+        self.ref_types_got_plt(&mut reference_tracker)?;
+        self.ref_types_got(&mut reference_tracker, &helper)?;
+        self.file.text.collect_references(&mut reference_tracker)?;
 
         self.export_got_plt(path.join("got.plt.s"))?;
         self.export_got(path.join("got.s"), &helper)?;
@@ -254,14 +254,12 @@ impl NSO {
         Ok(())
     }
 
-    fn ref_types_got_plt(&self) -> anyhow::Result<HashMap<u64, DataRefType>> {
+    fn ref_types_got_plt(&self, _reference_tracker: &mut ReferenceTracker) -> anyhow::Result<()> {
         // .got.plt only references functions outside of this binary
-        Ok(HashMap::new())
+        Ok(())
     }
 
-    fn ref_types_got(&self, helper: &NsoLookupHelper) -> anyhow::Result<HashMap<u64, DataRefType>> {
-        let mut ref_types = HashMap::new();
-
+    fn ref_types_got(&self, reference_tracker: &mut ReferenceTracker, helper: &NsoLookupHelper) -> anyhow::Result<()> {
         for i in 0..self.got_metadata.count {
             let got_entry_offset = self.got_metadata.start_offset + i * 8;
             let Some(entry_index) = helper.reloc_dyn_addr_to_idx.get(&got_entry_offset) else {
@@ -272,13 +270,13 @@ impl NSO {
             match entry.reloc_type {
                 RelocationType::R_AARCH64_GLOB_DAT | RelocationType::R_AARCH64_ABS64 => {}
                 RelocationType::R_AARCH64_RELATIVE => {
-                    ref_types.insert(entry.addend as u64, DataRefType::Int64);
+                    reference_tracker.add_reference(entry.addend as u64, got_entry_offset, DataRefType::Int64);
                 }
                 _ => bail!("Unsupported relocation type {:?} in .got", entry.reloc_type),
             }
         }
 
-        Ok(ref_types)
+        Ok(())
     }
 }
 
@@ -441,7 +439,7 @@ impl NsoLookupHelper {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum DataRefType {
     Int32,
     Int64,
@@ -451,4 +449,42 @@ pub enum DataRefType {
     Float64,
     Float128,
     Code,
+}
+
+pub struct ReferenceTracker {
+    pub references_by_target: HashMap<u64, (DataRefType, Vec<u64>)>,  // target -> (type, sources)
+    pub references_by_source: HashMap<u64, u64>,  // source -> target
+}
+impl ReferenceTracker {
+    pub fn new() -> Self {
+        Self {
+            references_by_target: HashMap::new(),
+            references_by_source: HashMap::new(),
+        }
+    }
+
+    pub fn add_reference(&mut self, target: u64, source: u64, data_type: DataRefType) -> Result<()> {
+        if let Some((existing_type, sources)) = self.references_by_target.get_mut(&target) {
+            ensure!(data_type == *existing_type, "Conflicting data types for reference to 0x{:X}", target);
+            sources.push(source);
+        } else {
+            self.references_by_target.insert(target, (data_type, vec![source]));
+        }
+        let old = self.references_by_source.insert(source, target);
+        ensure!(old.is_none(), "Source 0x{:X} already references target 0x{:X}", source, old.unwrap());
+        Ok(())
+    }
+
+    pub fn get_references_to(&self, target: u64) -> Option<&(DataRefType, Vec<u64>)> {
+        self.references_by_target.get(&target)
+    }
+
+    pub fn get_reference_from(&self, source: u64) -> Option<(DataRefType, u64)> {
+        if let Some(target) = self.references_by_source.get(&source) {
+            if let Some((data_type, _)) = self.references_by_target.get(target) {
+                return Some((*data_type, *target));
+            }
+        }
+        None
+    }
 }

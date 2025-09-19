@@ -1,10 +1,10 @@
 use std::{collections::{HashMap, HashSet}, io::Cursor, u64};
 
-use anyhow::{bail, ensure};
+use anyhow::{bail, ensure, Result};
 use binrw::{binread, BinRead};
 use capstone::{self, arch::{arm64::{Arm64Operand, Arm64OperandType}, ArchOperand, BuildsCapstone, BuildsCapstoneEndian}, InsnGroupId, RegId};
 
-use crate::nso::nso::DataRefType;
+use crate::nso::nso::{DataRefType, ReferenceTracker};
 
 pub struct TextSegment {
     pub module: Module,
@@ -21,13 +21,13 @@ impl TextSegment {
         Self { module, section, section_offset }
     }
 
-    pub fn collect_references(&self) -> anyhow::Result<HashMap<u64, DataRefType>> {
-        let mut ref_types: HashMap<u64, DataRefType> = HashMap::new();
+    pub fn collect_references(&self, mut reference_tracker: &mut ReferenceTracker) -> anyhow::Result<()> {
         let cs = construct_capstone()?;
 
         struct PotentialRef {
             register: capstone::RegId,
             offset: u64,
+            source_offset: u64,  // address of instruction that generated this potential reference
             ref_type: DataRefType,
         }
         struct BasicBlock {
@@ -65,18 +65,21 @@ impl TextSegment {
                 potential_refs: Vec::new(),
             }
         };
-        let handle_potential_ref = |mut block: BasicBlock, src_reg: RegId, offset: u64, ref_type: DataRefType, ref_types: &mut HashMap<u64, DataRefType>| {
+        let handle_potential_ref = |mut block: BasicBlock, src_reg: RegId, offset: u64, source_offset: u64, ref_type: DataRefType, reference_tracker: &mut ReferenceTracker| -> Result<BasicBlock> {
             if let Some(base) = block.adrp_targets_at_end.get(&src_reg) {
-                ref_types.insert(base + offset, ref_type);
+                reference_tracker.add_reference(base + offset, source_offset, ref_type)?;
             } else if !block.destroyed_regs.contains(&src_reg) {
                 block.potential_refs.push(PotentialRef {
                     register: src_reg,
                     offset,
+                    source_offset,
                     ref_type,
                 });
             }  // else: base register has been re-assigned to "useless" value within this block => ignore
-            block
+            Ok(block)
         };
+
+        // local analysis: find and analyze basic blocks
 
         while let Some(instr) = iter.next() {
             let Some(mnemonic) = instr.mnemonic() else {
@@ -98,27 +101,30 @@ impl TextSegment {
                     current_block = finish_basic_block(current_block, instr.address(), vec![]);
                 }
                 "bl" => {
-                    ref_types.insert(get_operand_imm(&detail, 0)?, DataRefType::Code);
+                    reference_tracker.add_reference(get_operand_imm(&detail, 0)?, instr.address(), DataRefType::Code)?;
                 }
                 "b" => {
                     let target = get_operand_imm(&detail, 0)?;
-                    ref_types.insert(target, DataRefType::Code);
+                    reference_tracker.add_reference(target, instr.address(), DataRefType::Code)?;
                     current_block = finish_basic_block(current_block, instr.address(), vec![target]);
                 }
                 "tbz" | "tbnz" => {
                     let target = get_operand_imm(&detail, 2)?;
-                    ref_types.insert(target, DataRefType::Code);
+                    reference_tracker.add_reference(target, instr.address(), DataRefType::Code)?;
                     current_block = finish_basic_block(current_block, instr.address(), vec![target, instr.address()+4]);
                 }
                 "cbz" | "cbnz" => {
                     let target = get_operand_imm(&detail, 1)?;
-                    ref_types.insert(target, DataRefType::Code);
+                    reference_tracker.add_reference(target, instr.address(), DataRefType::Code)?;
                     current_block = finish_basic_block(current_block, instr.address(), vec![target, instr.address()+4]);
                 }
                 s if s.starts_with("b.") => {  // conditionals with b (b.eq, b.ne, b.lt, ...)
                     let target = get_operand_imm(&detail, 0)?;
-                    ref_types.insert(target, DataRefType::Code);
+                    reference_tracker.add_reference(target, instr.address(), DataRefType::Code)?;
                     current_block = finish_basic_block(current_block, instr.address(), vec![target, instr.address()+4]);
+                }
+                "ret" => {
+                    current_block = finish_basic_block(current_block, instr.address(), vec![]);
                 }
 
                 // loads/stores
@@ -133,9 +139,10 @@ impl TextSegment {
                             current_block,
                             get_operand_reg(&detail, 1)?,
                             offset,
+                            instr.address(),
                             get_reg_type(get_operand_reg(&detail, 0)?, &cs)?,
-                            &mut ref_types
-                        );
+                            &mut reference_tracker
+                        )?;
                     }
                 }
                 "ldr" | "str" | "ldrh" | "strh" | "ldrb" | "strb" | "ldrsh" => {
@@ -143,9 +150,10 @@ impl TextSegment {
                         current_block,
                         get_operand_mem(&detail, 1)?.base(),
                         get_operand_mem(&detail, 1)?.disp() as u64,
+                        instr.address(),
                         get_reg_type(get_operand_reg(&detail, 0)?, &cs)?,
-                        &mut ref_types
-                    );
+                        &mut reference_tracker
+                    )?;
                 }
                 _ => {
                     ensure!(
@@ -161,144 +169,38 @@ impl TextSegment {
             }
         }
 
-        println!("Constructed {} basic blocks", blocks.len());
-        for i in 0..10 {
-            println!("Block {}: start=0x{:X}, end=0x{:X}, next={:?}, adrp_targets={:?}, destroyed_regs={:?}, potential_refs={}",
-                i, blocks[i].start, blocks[i].end, blocks[i].next_blocks, blocks[i].adrp_targets_at_end, blocks[i].destroyed_regs,
-                blocks[i].potential_refs.iter().map(|r| format!("(reg: {:?}, offset: 0x{:X}, type: {:?})", r.register, r.offset, r.ref_type)).collect::<Vec<String>>().join(", "));
-        }
-        // TODO: global analysis, passing around adrp between basic blocks
-        Ok(ref_types)
-    }
+        println!("#ref types: {}", reference_tracker.references_by_source.len());
 
-    pub fn collect_references_old(&self) -> anyhow::Result<HashMap<u64, DataRefType>> {
-        let mut ref_types = HashMap::new();
-
-        let cs = construct_capstone()?;
-
-        let mut x = cs.disasm_iter(&self.section, self.section_offset as u64)
-            .or_else(|e| bail!("Failed to disassemble text segment: {}", e))?;
-
-        let mut reg_offsets = HashMap::<capstone::RegId, u64>::new();
-        let mut reg_offsets_history = HashMap::<u64, HashMap<capstone::RegId, u64>>::new();
-        let mut reg_offsets_queued = HashMap::<u64, HashMap<capstone::RegId, u64>>::new();
-
-        while let Some(instr) = x.next() {
-            let Some(mnemonic) = instr.mnemonic() else {
-                bail!("Instruction at 0x{:X} has no mnemonic", instr.address());
-            };
-            if mnemonic == ".byte" {
-                continue; // expected for TRAP instructions = 0xE7FFDEFE
+        fn propagate_recursive(start: u64, reg: capstone::RegId, target: u64, blocks_map: &HashMap<u64, &BasicBlock>, reference_tracker: &mut ReferenceTracker) -> Result<()> {
+            println!("  Propagate to block at 0x{:X}", start);
+            let block = blocks_map.get(&start).ok_or_else(|| anyhow::anyhow!("Block not found: {}", start))?;
+            if block.destroyed_regs.contains(&reg) {
+                return Ok(());  // stop propagation
             }
-            let detail = cs.insn_detail(&instr)
-                .or_else(|e| bail!("Failed to get instruction detail: {}", e))?;
-
-            reg_offsets_history.insert(instr.address(), reg_offsets.clone());
-            if let Some(queued) = reg_offsets_queued.remove(&instr.address()) {
-                //ensure!(reg_offsets == queued, "Inconsistent register offset mapping at forward branch 0x{:X}: expected {:?}, got {:?}", instr.address(), queued, reg_offsets);
-            }
-
-            match mnemonic {
-                // branching/jumps/calls
-                "blr" => {}  // resolved at runtime, ignore
-                "br" => {
-                    ensure!(reg_offsets.is_empty(), "br instruction at 0x{:X} with non-empty reg_offsets: {:?}", instr.address(), reg_offsets);
-                }
-                "bl" => {
-                    ref_types.insert(get_operand_imm(&detail, 0)?, DataRefType::Code);
-                }
-                "b" => {
-                    let target = get_operand_imm(&detail, 0)?;
-                    ref_types.insert(target, DataRefType::Code);
-                    if target > instr.address() {
-                        reg_offsets_queued.insert(target, reg_offsets.clone());
-                    } else {
-                        //ensure!(reg_offsets == reg_offsets_history[&target], "Inconsistent register offset mapping at backward branch 0x{:X} to 0x{:X}: expected {:?}, got {:?}", instr.address(), target, reg_offsets_history[&target], reg_offsets);
-                    }
-                    if let Some(offs) = reg_offsets_queued.remove(&(instr.address()+4)) {
-                        //reg_offsets = offs;
-                        println!("Resumed branch delay slot at 0x{:X}: {:?}", instr.address()+4, reg_offsets);
-                    }
-                }
-                "tbz" | "tbnz" => {
-                    let target = get_operand_imm(&detail, 2)?;
-                    ref_types.insert(target, DataRefType::Code);
-                    if target > instr.address() {
-                        reg_offsets_queued.insert(target, reg_offsets.clone());
-                    } else {
-                        //ensure!(reg_offsets == reg_offsets_history[&target], "Inconsistent register offset mapping at backward branch 0x{:X} to 0x{:X}: expected {:?}, got {:?}", instr.address(), target, reg_offsets_history[&target], reg_offsets);
-                    }
-                }
-                "cbz" | "cbnz" => {
-                    let target = get_operand_imm(&detail, 1)?;
-                    ref_types.insert(target, DataRefType::Code);
-                    if target > instr.address() {
-                        reg_offsets_queued.insert(target, reg_offsets.clone());
-                    } else {
-                        //ensure!(reg_offsets == reg_offsets_history[&target], "Inconsistent register offset mapping at backward branch 0x{:X} to 0x{:X}: expected {:?}, got {:?}", instr.address(), target, reg_offsets_history[&target], reg_offsets);
-                    }
-                }
-                s if s.starts_with("b.") => {  // conditionals with b (b.eq, b.ne, b.lt, ...)
-                    let target = get_operand_imm(&detail, 0)?;
-                    ref_types.insert(target, DataRefType::Code);
-                    if target > instr.address() {
-                        println!("Queued branch to 0x{:X} from 0x{:X}: {:?}", target, instr.address(), reg_offsets);
-                        reg_offsets_queued.insert(target, reg_offsets.clone());
-                    } else {
-                        //ensure!(reg_offsets == reg_offsets_history[&target], "Inconsistent register offset mapping at backward branch 0x{:X} to 0x{:X}: expected {:?}, got {:?}", instr.address(), target, reg_offsets_history[&target], reg_offsets);
-                    }
-                }
-
-                // loads/stores
-                "adr" => {bail!("Unhandled adr instruction at 0x{:X}", instr.address());}
-                "adrp" => {
-                    let old_mapping = reg_offsets.insert(get_operand_reg(&detail, 0)?, get_operand_imm(&detail, 1)?);
-                    //ensure!(old_mapping.is_none(), "Register {:?} already has a mapping", get_operand_reg(&detail, 0)?);
-                }
-                "add" => {
-                    let src_reg = get_operand_reg(&detail, 1)?;
-                    let Some(base) = reg_offsets.remove(&src_reg) else {
-                        continue;
-                    };
-                    ref_types.insert(base + get_operand_imm(&detail, 2)?, get_reg_type(get_operand_reg(&detail, 0)?, &cs)?);
-                }
-                "ldr" | "str" | "ldrh" | "strh" | "ldrb" | "strb" | "ldrsh" => {
-                    let mem = get_operand_mem(&detail, 1)?;
-                    let Some(base) = reg_offsets.remove(&mem.base()) else {
-                        continue;
-                    };
-                    ref_types.insert(base + mem.disp() as u64, get_reg_type(get_operand_reg(&detail, 0)?, &cs)?);
-                }
-                _ => {
-                    ensure!(
-                        !detail.groups().contains(&InsnGroupId(capstone::arch::arm64::Arm64InsnGroup::ARM64_GRP_JUMP as u8)),
-                        "Unhandled jump instruction mnemonic: {} at 0x{:X}", mnemonic, instr.address()
-                    );
-                    ensure!(
-                        !detail.groups().contains(&InsnGroupId(capstone::arch::arm64::Arm64InsnGroup::ARM64_GRP_CALL as u8)),
-                        "Unhandled call instruction mnemonic: {} at 0x{:X}", mnemonic, instr.address()
-                    );
-                    for reg in detail.regs_read().iter().chain(detail.regs_write().iter()) {
-                        if reg_offsets.contains_key(reg) {
-                            println!("AAA: {:X}", 0x7100000000+instr.address());
-                            continue;
-                        }
-                        //ensure!(!reg_offsets.contains_key(reg), "Mapped register {:?} used in unknown instruction mnemonic: {} at 0x{:X}", reg, mnemonic, instr.address());
-                    }
-                    if mnemonic == "adr" {
-                        println!("Unhandled adr instruction at 0x{:X}", instr.address());
-                    }
-                    //println!("Unhandled instruction mnemonic: {} at 0x{:X}", mnemonic, instr.address());
+            for pref in block.potential_refs.iter() {
+                if pref.register == reg {
+                    reference_tracker.add_reference(target + pref.offset, pref.source_offset, pref.ref_type)?;
                 }
             }
-
-            //println!("{:?} ; {:?}", instr, detail);
+            for next in block.next_blocks.iter() {
+                propagate_recursive(*next, reg, target, blocks_map, reference_tracker)?;
+            }
+            Ok(())
         }
 
-        ensure!(reg_offsets.is_empty(), "Some registers still have mappings: {:?}", reg_offsets);
-        println!("Register offset mapping history (most recent last): {}", reg_offsets_history.len());
+        let blocks_map = blocks.iter().map(|b| (b.start, b)).collect::<HashMap<u64, &BasicBlock>>();
 
-        Ok(ref_types)
+        for block in blocks.iter() {
+            for adrp in block.adrp_targets_at_end.iter() {
+                for next in block.next_blocks.iter() {
+                    println!("Propagating adrp from 0x{:X} to 0x{:X}", block.start, next);
+                    propagate_recursive(*next, *adrp.0, *adrp.1, &blocks_map, &mut reference_tracker)?;
+                }
+            }
+        }
+
+        println!("#ref types: {}", reference_tracker.references_by_source.len());
+        Ok(())
     }
 }
 
