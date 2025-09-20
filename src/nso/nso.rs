@@ -270,7 +270,7 @@ impl NSO {
             match entry.reloc_type {
                 RelocationType::R_AARCH64_GLOB_DAT | RelocationType::R_AARCH64_ABS64 => {}
                 RelocationType::R_AARCH64_RELATIVE => {
-                    reference_tracker.add_reference(entry.addend as u64, got_entry_offset, DataRefType::Int64);
+                    reference_tracker.add_reference(entry.addend as u64, got_entry_offset, DataRefType::Unknown);
                 }
                 _ => bail!("Unsupported relocation type {:?} in .got", entry.reloc_type),
             }
@@ -439,16 +439,18 @@ impl NsoLookupHelper {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+// top = most specific. If conflicts are found, the lower value (more specific) is used.
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub enum DataRefType {
-    Int32,
-    Int64,
+    Code,
     Float8,
     Float16,
     Float32,
+    Int32,
     Float64,
+    Int64,
     Float128,
-    Code,
+    Unknown,
 }
 
 pub struct ReferenceTracker {
@@ -465,13 +467,15 @@ impl ReferenceTracker {
 
     pub fn add_reference(&mut self, target: u64, source: u64, data_type: DataRefType) -> Result<()> {
         if let Some((existing_type, sources)) = self.references_by_target.get_mut(&target) {
-            ensure!(data_type == *existing_type, "Conflicting data types for reference to 0x{:X}", target);
+            if data_type != *existing_type {
+                *existing_type = std::cmp::min(data_type, *existing_type);
+            }
             sources.push(source);
         } else {
             self.references_by_target.insert(target, (data_type, vec![source]));
         }
         let old = self.references_by_source.insert(source, target);
-        ensure!(old.is_none(), "Source 0x{:X} already references target 0x{:X}", source, old.unwrap());
+        ensure!(old.is_none_or(|old| old == target), "Source 0x{:X} already references target 0x{:X}, now tries to reference 0x{:X}", source, old.unwrap(), target);
         Ok(())
     }
 

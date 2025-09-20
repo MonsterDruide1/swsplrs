@@ -14,9 +14,12 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args: Args = argh::from_env();
+    println!("Input file: {}", args.input);
+    println!("Reading NSO file...");
     let nso = NSO::new(NsoFile::new(File::open(&args.input)?)?)?;
 
-    println!("Input file: {}", args.input);
+    println!("Exporting all segments to 'out' directory...");
     nso.export_all(std::path::Path::new("out"))?;
+    println!("Done.");
     Ok(())
 }
