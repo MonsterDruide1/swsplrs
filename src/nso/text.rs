@@ -223,8 +223,6 @@ impl TextSegment {
             }
         }
 
-        println!("#ref types: {}", reference_tracker.references_by_source.len());
-
         fn propagate_recursive(start: u64, reg: capstone::RegId, target: u64, blocks_map: &RangeMap<u64, BasicBlock>, reference_tracker: &mut ReferenceTracker, visited_blocks: &mut HashSet<u64>) -> Result<()> {
             if !visited_blocks.insert(start) {
                 return Ok(());  // already visited
@@ -257,9 +255,6 @@ impl TextSegment {
         }
         // TODO: repeat check in other direction? Double-verify references by going backwards and checking that ref can always be resolved
 
-        // FIXME: must first build basic blocks, then analyze references, otherwise "merging blocks" (b into middle of another block) misses block creation
-
-        println!("#ref types: {}", reference_tracker.references_by_source.len());
         Ok(())
     }
 }
