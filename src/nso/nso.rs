@@ -89,6 +89,7 @@ impl NSO {
 
         self.export_got_plt(path.join("got.plt.s"))?;
         self.export_got(path.join("got.s"), &helper)?;
+        self.file.text.export_asm(path.join("text.s"), &reference_tracker)?;
         Ok(())
     }
 
@@ -270,7 +271,7 @@ impl NSO {
             match entry.reloc_type {
                 RelocationType::R_AARCH64_GLOB_DAT | RelocationType::R_AARCH64_ABS64 => {}
                 RelocationType::R_AARCH64_RELATIVE => {
-                    reference_tracker.add_reference(entry.addend as u64, got_entry_offset, DataRefType::Unknown);
+                    reference_tracker.add_reference(entry.addend as u64, got_entry_offset, DataRefType::Unknown)?;
                 }
                 _ => bail!("Unsupported relocation type {:?} in .got", entry.reloc_type),
             }

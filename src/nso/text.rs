@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, HashMap, HashSet}, io::Cursor, u64};
+use std::{collections::{HashMap, HashSet}, fs::File, io::Cursor, path::Path, u64};
 
 use anyhow::{bail, ensure, Result};
 use binrw::{binread, BinRead};
@@ -33,10 +33,16 @@ impl TextSegment {
             ref_type: DataRefType,
         }
         #[derive(Debug, Clone)]
+        struct AdrpInfo {
+            target: u64,
+            location: u64,  // address of the adrp instruction
+            has_been_used: bool,
+        }
+        #[derive(Debug, Clone)]
         struct BasicBlock {
             next_blocks: Vec<u64>,
-            adrp_targets_at_end: HashMap<capstone::RegId, u64>,
-            destroyed_regs: HashSet<capstone::RegId>,
+            adrp_targets_at_end: HashMap<capstone::RegId, AdrpInfo>,
+            destroyed_regs: HashSet<capstone::RegId>,  // 64-bit integer registers (X0-X30) that have been overwritten in this block
             potential_refs: Vec<PotentialRef>,
         }
         let mut blocks = RangeMap::<u64, BasicBlock>::new();
@@ -50,19 +56,6 @@ impl TextSegment {
             let mut finish_basic_block = |instr_addr: u64, next_blocks: Vec<u64>| {
                 let start = current_start;
                 let end = instr_addr + 4;
-
-                // check if existing blocks must be splitted based on `next_blocks`
-                // if yes, replace first half with new block that only has second half as "next"
-                for next in &next_blocks {
-                    if let Some((range, _)) = blocks.get_key_value(&next) && range.start != *next {
-                        blocks.insert(range.start..*next, BasicBlock {
-                            next_blocks: vec![*next],
-                            adrp_targets_at_end: HashMap::new(),
-                            destroyed_regs: HashSet::new(),
-                            potential_refs: Vec::new(),
-                        });
-                    }
-                }
                 blocks.insert(start..end, BasicBlock {
                     next_blocks,
                     adrp_targets_at_end: HashMap::new(),
@@ -126,6 +119,20 @@ impl TextSegment {
                     }
                 }
             }
+
+            // iterate over all blocks again, check their "next" references and split blocks if necessary
+            let nexts: Vec<u64> = blocks.iter().flat_map(|(_, b)| b.next_blocks.clone()).collect();
+            for next in nexts {
+                if let Some((range, _)) = blocks.get_key_value(&next) && range.start != next {
+                    //println!("Splitting existing block 0x{:X} to 0x{:X} at 0x{:X}, overwriting from 0x{:X} to 0x{:X}", range.start, range.end, next, range.start, next);
+                    blocks.insert(range.start..next, BasicBlock {
+                        next_blocks: vec![next],
+                        adrp_targets_at_end: HashMap::new(),
+                        destroyed_regs: HashSet::new(),
+                        potential_refs: Vec::new(),
+                    });
+                }
+            }
         }
 
         ensure!(
@@ -136,8 +143,10 @@ impl TextSegment {
         // local analysis: analyze basic blocks
         {
             let handle_potential_ref = |block: &mut BasicBlock, src_reg: RegId, offset: u64, source_offset: u64, ref_type: DataRefType, reference_tracker: &mut ReferenceTracker| -> Result<()> {
-                if let Some(base) = block.adrp_targets_at_end.get(&src_reg) {
-                    reference_tracker.add_reference(base + offset, source_offset, ref_type)?;
+                if let Some(adrp) = block.adrp_targets_at_end.get_mut(&src_reg) {
+                    reference_tracker.add_reference(adrp.target + offset, source_offset, ref_type)?;
+                    reference_tracker.add_reference(adrp.target + offset, adrp.location, ref_type)?;
+                    adrp.has_been_used = true;  // mark as used within this block
                 } else if !block.destroyed_regs.contains(&src_reg) {
                     block.potential_refs.push(PotentialRef {
                         register: src_reg,
@@ -164,8 +173,6 @@ impl TextSegment {
                 let Some((range, current_block)) = blocks.get_key_mut_value(&instr.address()) else {
                     bail!("No block associated with current address: 0x{:X}", instr.address());
                 };
-                current_block.destroyed_regs.extend(detail.regs_write());
-                current_block.adrp_targets_at_end.retain(|reg, _| !detail.regs_write().contains(reg));
 
                 match mnemonic {
                     // branching/jumps/calls
@@ -183,7 +190,13 @@ impl TextSegment {
                     // loads/stores
                     "adr" => {bail!("Unhandled adr instruction at 0x{:X}", instr.address());}
                     "adrp" => {
-                        current_block.adrp_targets_at_end.insert(get_operand_reg(&detail, 0)?, get_operand_imm(&detail, 1)?);
+                        current_block.adrp_targets_at_end.insert(get_operand_reg(&detail, 0)?, AdrpInfo {
+                            target: get_operand_imm(&detail, 1)?,
+                            location: instr.address(),
+                            has_been_used: false,
+                        });
+                        //println!("Found ADRP at 0x{:X} targeting 0x{:X} in register {:?}", instr.address(), get_operand_imm(&detail, 1)?, get_operand_reg(&detail, 0)?);
+                        //println!("  Current block state: {:?}", current_block);
                     }
                     "add" => {
                         // we are only interested in adds with last operand being an immediate (=> offset)
@@ -220,41 +233,161 @@ impl TextSegment {
                         //println!("Unhandled instruction mnemonic: {} at 0x{:X}", mnemonic, instr.address());
                     }
                 }
+
+                // collect destroyed X-registers: either a direct write, or a write to the W-version of the register
+                let destroyed_regs: Vec<RegId> = detail.regs_write().iter().filter_map(|r| {
+                    // X29 and X30 are FP and LR, which have a lower value than X0-X28
+                    if r.0 >= Arm64Reg::ARM64_REG_X0 as u16 && r.0 <= Arm64Reg::ARM64_REG_X28 as u16 {
+                        Some(*r)
+                    } else if r.0 == Arm64Reg::ARM64_REG_X29 as u16 || r.0 == Arm64Reg::ARM64_REG_X30 as u16 {
+                        Some(*r)
+                    } else if r.0 >= Arm64Reg::ARM64_REG_W0 as u16 && r.0 <= Arm64Reg::ARM64_REG_W28 as u16 {
+                        Some(RegId(r.0 - (Arm64Reg::ARM64_REG_W0 as u16) + (Arm64Reg::ARM64_REG_X0 as u16)))  // map Wn to Xn
+                    } else if r.0 == Arm64Reg::ARM64_REG_W29 as u16 || r.0 == Arm64Reg::ARM64_REG_W30 as u16 {
+                        Some(RegId(r.0 - (Arm64Reg::ARM64_REG_W29 as u16) + (Arm64Reg::ARM64_REG_X29 as u16)))  // map W29/W30 to X29/X30
+                    } else {
+                        None  // ignore all other registers
+                    }
+                }).collect();
+                // after handling instruction, mark all written registers as destroyed
+                current_block.destroyed_regs.extend(destroyed_regs.iter());
+                if mnemonic != "adrp" {
+                    // result register of adrp is destroyed, but new entry should be retained
+                    current_block.adrp_targets_at_end.retain(|reg, _| !destroyed_regs.contains(reg));
+                }
             }
         }
 
-        fn propagate_recursive(start: u64, reg: capstone::RegId, target: u64, blocks_map: &RangeMap<u64, BasicBlock>, reference_tracker: &mut ReferenceTracker, visited_blocks: &mut HashSet<u64>) -> Result<()> {
-            if !visited_blocks.insert(start) {
-                return Ok(());  // already visited
-            }
-            //println!("  Propagate to block at 0x{:X}", start);
-            let block = blocks_map.get(&start).ok_or_else(|| anyhow::anyhow!("Block not found: {}", start))?;
-            if block.destroyed_regs.contains(&reg) {
-                return Ok(());  // stop propagation
-            }
-            for pref in block.potential_refs.iter() {
-                if pref.register == reg {
-                    reference_tracker.add_reference(target + pref.offset, pref.source_offset, pref.ref_type)?;
+        // global analysis: propagate `ADRP` targets through blocks, resolve potential references
+        {
+            fn propagate_recursive(start: u64, reg: capstone::RegId, adrp: &AdrpInfo, blocks_map: &RangeMap<u64, BasicBlock>, reference_tracker: &mut ReferenceTracker, visited_blocks: &mut HashSet<u64>) -> Result<bool> {
+                if !visited_blocks.insert(start) {
+                    return Ok(false);  // already visited
                 }
+                let block = blocks_map.get(&start).ok_or_else(|| anyhow::anyhow!("Block not found: {}", start))?;
+                //println!("  Propagate to block at 0x{:X}: {:?}", start, block);
+                let mut found = false;
+                for pref in block.potential_refs.iter() {
+                    if pref.register == reg {
+                        reference_tracker.add_reference(adrp.target + pref.offset, pref.source_offset, pref.ref_type)?;
+                        reference_tracker.add_reference(adrp.target + pref.offset, adrp.location, pref.ref_type)?;
+                        //println!("Resolved reference at 0x{:X} using ADRP at 0x{:X}", pref.source_offset, adrp.location);
+                        found = true;
+                    }
+                }
+                if !block.destroyed_regs.contains(&reg) {
+                    for next in block.next_blocks.iter() {
+                        found |= propagate_recursive(*next, reg, adrp, blocks_map, reference_tracker, visited_blocks)?;
+                    }
+                }
+                Ok(found)
             }
-            for next in block.next_blocks.iter() {
-                propagate_recursive(*next, reg, target, blocks_map, reference_tracker, visited_blocks)?;
-            }
-            Ok(())
-        }
 
-        let mut visited_blocks = HashSet::<u64>::new();  // visited blocks
-        for (range, block) in blocks.iter() {
-            for (reg, target) in block.adrp_targets_at_end.iter() {
-                for next in block.next_blocks.iter() {
-                    //println!("Propagating adrp from 0x{:X} to 0x{:X}", range.start, next);
-                    propagate_recursive(*next, *reg, *target, &blocks, &mut reference_tracker, &mut visited_blocks)?;
+            let mut visited_blocks = HashSet::<u64>::new();  // visited blocks
+            for (range, block) in blocks.iter() {
+                //println!("Propagating ADRPs for block 0x{:X}-0x{:X}: {:?}", range.start, range.end, block);
+                for (reg, adrp) in block.adrp_targets_at_end.iter() {
+                    let mut found = adrp.has_been_used;
+                    for next in block.next_blocks.iter() {
+                        //println!("Propagating adrp from 0x{:X} to 0x{:X}", range.start, next);
+                        found |= propagate_recursive(*next, *reg, adrp, &blocks, &mut reference_tracker, &mut visited_blocks)?;
+                    }
+                    ensure!(found, "ADRP target at 0x{:X} in register {:?} in block 0x{:X}-0x{:X} could not be propagated to any reference", adrp.target, reg, range.start, range.end);
+                    visited_blocks.clear();
                 }
-                visited_blocks.clear();
             }
         }
         // TODO: repeat check in other direction? Double-verify references by going backwards and checking that ref can always be resolved
 
+        Ok(())
+    }
+
+    fn get_symbol(&self, address: u64) -> Result<String> {
+        // TODO potentially use symbol name, otherwise fallback to loc_{address}
+        Ok(format!("loc_{:X}", address))
+    }
+
+    pub fn export_asm(&self, path: impl AsRef<Path>, reference_tracker: &ReferenceTracker) -> Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        let cs = construct_capstone()?;
+
+        let mut iter = cs.disasm_iter(&self.section, self.section_offset as u64)
+            .or_else(|e| bail!("Failed to disassemble text segment: {}", e))?;
+        
+        // TODO .fill {dist}, 1, 0 ???
+        while let Some(instr) = iter.next() {
+            if reference_tracker.get_references_to(instr.address()).is_some() {
+                // TODO potentially mark as `.global {sym}`
+                writeln!(file, "{}:", self.get_symbol(instr.address())?)?;
+            }
+
+            let Some(mnemonic) = instr.mnemonic() else {
+                bail!("Instruction at 0x{:X} has no mnemonic", instr.address());
+            };
+            if mnemonic == ".byte" {
+                if instr.bytes() == [0xFE, 0xDE, 0xFF, 0xE7] {
+                    writeln!(file, "\ttrap")?;
+                } else {
+                    writeln!(file, "    .byte {}", instr.bytes().iter().map(|b| format!("0x{:02X}", b)).collect::<Vec<_>>().join(", "))?;
+                }
+                continue;
+            }
+            let detail = cs.insn_detail(&instr)
+                .or_else(|e| bail!("Failed to get instruction detail: {}", e))?;
+            let reference_target = reference_tracker.get_reference_from(instr.address())
+                .ok_or(anyhow::anyhow!("No reference found for instruction at 0x{:X}", instr.address()))
+                .map(|(_, target)| target);
+
+            match mnemonic {
+                // branching/jumps/calls
+                //  blr, br, ret remain unchanged
+                "bl" | "b" => {
+                    writeln!(file, "\t{} {}", mnemonic, self.get_symbol(reference_target?)?)?;
+                }
+                "tbz" | "tbnz" => {
+                    writeln!(file, "\t{} {}, #{}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_imm(&detail, 1)?, self.get_symbol(reference_target?)?)?;
+                }
+                "cbz" | "cbnz" => {
+                    writeln!(file, "\t{} {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, self.get_symbol(reference_target?)?)?;
+                }
+                s if s.starts_with("b.") => {  // conditionals with b (b.eq, b.ne, b.lt, ...)
+                    writeln!(file, "\t{} {}", mnemonic, self.get_symbol(reference_target?)?)?;
+                }
+
+                // loads/stores
+                "adr" => {bail!("Unhandled adr instruction at 0x{:X}", instr.address());}
+                "adrp" => {
+                    writeln!(file, "\t{} {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, self.get_symbol(reference_target?)?)?;
+                }
+                "add" => {
+                    // we are only interested in adds with last operand being an immediate (=> offset)
+                    if let Ok(_) = get_operand_imm(&detail, 2) {
+                        if let Ok(target) = reference_target {
+                            writeln!(file, "\t{} {}, {}, :lo12:{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, self.get_symbol(target)?)?;
+                        } else {
+                            writeln!(file, "\t{} {}, {}, #{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, get_operand_imm(&detail, 2)?)?;
+                        }
+                    } else {
+                        writeln!(file, "\t{} {}, {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, get_operand_reg_name(&detail, 2, &cs)?)?;
+                    }
+                }
+                "ldr" | "str" | "ldrh" | "strh" | "ldrb" | "strb" | "ldrsh" => {
+                    let base_reg = get_operand_mem(&detail, 1)?.base();
+                    let base_reg_name = cs.reg_name(base_reg)
+                        .ok_or_else(|| anyhow::anyhow!("Failed to get register name for {:?}", base_reg))?;
+                    if let Ok(target) = reference_target {
+                        println!("Reference found for memory operand at 0x{:X} to 0x{:X}", instr.address(), target);
+                        writeln!(file, "\t{} {}, [{}, :lo12:{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, self.get_symbol(target)?)?;
+                    } else {
+                        writeln!(file, "\t{} {}, [{}, #{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, get_operand_mem(&detail, 1)?.disp())?;
+                    }
+                }
+                _ => {
+                    writeln!(file, "\t{} {}", mnemonic, instr.op_str().ok_or_else(|| anyhow::anyhow!("Failed to get operand string"))?)?;
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -302,6 +435,11 @@ fn get_operand_reg(detail: &capstone::InsnDetail, idx: usize) -> anyhow::Result<
         bail!("Unexpected operand type in instruction");
     };
     Ok(*reg)
+}
+fn get_operand_reg_name(detail: &capstone::InsnDetail, idx: usize, cs: &capstone::Capstone) -> anyhow::Result<String> {
+    let reg = get_operand_reg(detail, idx)?;
+    cs.reg_name(reg)
+        .ok_or_else(|| anyhow::anyhow!("Failed to get register name for {:?}", reg))
 }
 fn get_operand_mem(detail: &capstone::InsnDetail, idx: usize) -> anyhow::Result<capstone::arch::arm64::Arm64OpMem> {
     let ops = detail.arch_detail().operands();
