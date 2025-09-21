@@ -107,10 +107,10 @@ impl NSO {
             Ok(())
         }
 
-        // TODO: collect references from symbol table
         // TODO: collect references from data and rodata?
         let collect_references: Vec<(&str, Box<dyn FnMut(&mut ReferenceTracker, &Option<MultiProgress>) -> anyhow::Result<()>>)> = vec![
             (".rela.dyn", Box::new(|r,_| self.ref_types_relocations(r))),
+            (".dynsym", Box::new(|r,_| self.ref_types_symbols(r))),
             (".text", Box::new(|r,m| self.file.text.collect_references(r, &m))),
         ];
         let total_collect_references = collect_references.len();
@@ -243,14 +243,46 @@ impl NSO {
         for relocation in self.reloc_dyn_table.iter() {
             match relocation.reloc_type {
                 RelocationType::R_AARCH64_GLOB_DAT | RelocationType::R_AARCH64_ABS64 => {
-                    reference_tracker.add_reference(self.symbol_table[relocation.sym_idx as usize].value, relocation.offset, DataRefType::Unknown, SourceConflictResolution::Error)?;
+                    reference_tracker.add_reference(self.symbol_table[relocation.sym_idx as usize].value, ReferenceSource::Relocation(relocation.offset), DataRefType::Unknown, SourceConflictResolution::Error)?;
                 }
                 RelocationType::R_AARCH64_RELATIVE => {
-                    reference_tracker.add_reference(relocation.addend as u64, relocation.offset, DataRefType::Unknown, SourceConflictResolution::Error)?;
+                    reference_tracker.add_reference(relocation.addend as u64, ReferenceSource::Relocation(relocation.offset), DataRefType::Unknown, SourceConflictResolution::Error)?;
                 }
                 _ => bail!("Unsupported relocation type {:?} in .rela.dyn", relocation.reloc_type),
             }
         }
+        Ok(())
+    }
+
+    fn ref_types_symbols(&self, reference_tracker: &mut ReferenceTracker) -> anyhow::Result<()> {
+        for symbol in self.symbol_table.iter() {
+            if symbol.value == 0 {
+                continue;  // doesn't point to anything within this binary => not interesting
+            }
+            let name = self.dynstr_table.get(&(symbol.str_table_offset as u64));
+            let sym_type = symbol.get_type()?;
+            match sym_type {
+                DynamicSymbolType::STT_OBJECT => {
+                    reference_tracker.add_reference(symbol.value, ReferenceSource::Symbol, DataRefType::Unknown, SourceConflictResolution::KeepFirst)?;
+                }
+                DynamicSymbolType::STT_FUNC => {
+                    reference_tracker.add_reference(symbol.value, ReferenceSource::Symbol, DataRefType::Code, SourceConflictResolution::KeepFirst)?;
+                }
+                DynamicSymbolType::STT_NOTYPE => {
+                    ensure!(name.is_some_and(|x| x == "end"),
+                        "Unsupported STT_NOTYPE symbol in .dynsym at {:X}: {}",
+                        symbol.value, name.unwrap_or(&"<unknown>".to_string())
+                    );
+                }
+                _ => {
+                    bail!(
+                        "Unsupported symbol type {:?} in .dynsym at {:X}: {}",
+                        sym_type, symbol.value, name.unwrap_or(&"<unknown>".to_string())
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -455,7 +487,7 @@ pub struct DynamicSymbol {
     pub size: u64,
 }
 #[repr(u8)]
-#[derive(Debug, TryFromPrimitive)]
+#[derive(Debug, TryFromPrimitive, Eq, PartialEq, Hash)]
 #[allow(non_camel_case_types)]
 pub enum DynamicSymbolBind {
     STB_LOCAL = 0,
@@ -463,7 +495,7 @@ pub enum DynamicSymbolBind {
     STB_WEAK = 2
 }
 #[repr(u8)]
-#[derive(Debug, TryFromPrimitive)]
+#[derive(Debug, TryFromPrimitive, Eq, PartialEq, Hash)]
 #[allow(non_camel_case_types)]
 pub enum DynamicSymbolType {
     STT_NOTYPE = 0,
@@ -475,7 +507,7 @@ pub enum DynamicSymbolType {
     STT_TLS = 6
 }
 #[repr(u8)]
-#[derive(Debug, TryFromPrimitive)]
+#[derive(Debug, TryFromPrimitive, Eq, PartialEq, Hash)]
 #[allow(non_camel_case_types)]
 pub enum DynamicSymbolVisibility {
     STV_DEFAULT = 0,
@@ -622,10 +654,16 @@ pub enum SourceConflictResolution {
     KeepFirst,  // keep the first reference type found, ignore all others (used for `adrp`)
     BlockSource,  // delete existing reference and prevent future references from the same source (used for `adrp` + `add`/`ldr`)
 }
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum ReferenceSource {
+    Instruction(u64),  // address of instruction
+    Symbol,
+    Relocation(u64),   // offset of relocation
+}
 
 pub struct ReferenceTracker {
-    pub references_by_target: HashMap<u64, (DataRefType, Vec<u64>)>,  // target -> (type, sources)
-    pub references_by_source: HashMap<u64, (u64, SourceConflictResolution)>,  // source -> (target, resolution)
+    pub references_by_target: HashMap<u64, (DataRefType, Vec<ReferenceSource>)>,  // target -> (type, sources)
+    pub references_by_source: HashMap<ReferenceSource, (u64, SourceConflictResolution)>,  // source -> (target, resolution)
 }
 impl ReferenceTracker {
     pub fn new() -> Self {
@@ -635,7 +673,7 @@ impl ReferenceTracker {
         }
     }
 
-    pub fn add_reference(&mut self, target: u64, source: u64, data_type: DataRefType, source_conflict_resolution: SourceConflictResolution) -> Result<()> {
+    pub fn add_reference(&mut self, target: u64, source: ReferenceSource, data_type: DataRefType, source_conflict_resolution: SourceConflictResolution) -> Result<()> {
         if let Some((existing_type, sources)) = self.references_by_target.get_mut(&target) {
             if data_type != *existing_type {
                 *existing_type = std::cmp::min(data_type, *existing_type);
@@ -645,9 +683,9 @@ impl ReferenceTracker {
             self.references_by_target.insert(target, (data_type, vec![source]));
         }
         if let Some((old, old_resolution)) = self.references_by_source.get(&source) && *old != target {
-            ensure!(*old_resolution == source_conflict_resolution, "Source conflict resolution for source 0x{:X} changed from {:?} to {:?}", source, old_resolution, source_conflict_resolution);
+            ensure!(*old_resolution == source_conflict_resolution, "Source conflict resolution for source {:?} changed from {:?} to {:?}", source, old_resolution, source_conflict_resolution);
             match source_conflict_resolution {
-                SourceConflictResolution::Error => bail!("Source 0x{:X} already references target 0x{:X}, now tries to reference 0x{:X}", source, old, target),
+                SourceConflictResolution::Error => bail!("Source {:?} already references target 0x{:X}, now tries to reference 0x{:X}", source, old, target),
                 SourceConflictResolution::KeepFirst => {},
                 SourceConflictResolution::BlockSource => {
                     self.references_by_source.insert(source, (u64::MAX, source_conflict_resolution));  // mark as blocked
@@ -664,11 +702,11 @@ impl ReferenceTracker {
         Ok(())
     }
 
-    pub fn get_references_to(&self, target: u64) -> Option<&(DataRefType, Vec<u64>)> {
+    pub fn get_references_to(&self, target: u64) -> Option<&(DataRefType, Vec<ReferenceSource>)> {
         self.references_by_target.get(&target)
     }
 
-    pub fn get_reference_from(&self, source: u64) -> Option<(DataRefType, u64)> {
+    pub fn get_reference_from(&self, source: ReferenceSource) -> Option<(DataRefType, u64)> {
         if let Some((target, _)) = self.references_by_source.get(&source) {
             if let Some((data_type, _)) = self.references_by_target.get(target) {
                 return Some((*data_type, *target));

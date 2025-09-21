@@ -6,7 +6,7 @@ use capstone::{self, arch::{arm64::{Arm64Operand, Arm64OperandType, Arm64Reg}, A
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rangemap::RangeMap;
 
-use crate::nso::nso::{DataRefType, ReferenceTracker, SourceConflictResolution, NSO};
+use crate::nso::nso::{DataRefType, ReferenceSource, ReferenceTracker, SourceConflictResolution, NSO};
 
 pub struct TextSegment {
     pub module: Module,
@@ -90,26 +90,26 @@ impl TextSegment {
                         finish_basic_block(instr.address(), vec![]);
                     }
                     "bl" => {
-                        reference_tracker.add_reference(get_operand_imm(&detail, 0)?, instr.address(), DataRefType::Code, SourceConflictResolution::Error)?;
+                        reference_tracker.add_reference(get_operand_imm(&detail, 0)?, ReferenceSource::Instruction(instr.address()), DataRefType::Code, SourceConflictResolution::Error)?;
                     }
                     "b" => {
                         let target = get_operand_imm(&detail, 0)?;
-                        reference_tracker.add_reference(target, instr.address(), DataRefType::Code, SourceConflictResolution::Error)?;
+                        reference_tracker.add_reference(target, ReferenceSource::Instruction(instr.address()), DataRefType::Code, SourceConflictResolution::Error)?;
                         finish_basic_block(instr.address(), vec![target]);
                     }
                     "tbz" | "tbnz" => {
                         let target = get_operand_imm(&detail, 2)?;
-                        reference_tracker.add_reference(target, instr.address(), DataRefType::Code, SourceConflictResolution::Error)?;
+                        reference_tracker.add_reference(target, ReferenceSource::Instruction(instr.address()), DataRefType::Code, SourceConflictResolution::Error)?;
                         finish_basic_block(instr.address(), vec![target, instr.address()+4]);
                     }
                     "cbz" | "cbnz" => {
                         let target = get_operand_imm(&detail, 1)?;
-                        reference_tracker.add_reference(target, instr.address(), DataRefType::Code, SourceConflictResolution::Error)?;
+                        reference_tracker.add_reference(target, ReferenceSource::Instruction(instr.address()), DataRefType::Code, SourceConflictResolution::Error)?;
                         finish_basic_block(instr.address(), vec![target, instr.address()+4]);
                     }
                     s if s.starts_with("b.") => {  // conditionals with b (b.eq, b.ne, b.lt, ...)
                         let target = get_operand_imm(&detail, 0)?;
-                        reference_tracker.add_reference(target, instr.address(), DataRefType::Code, SourceConflictResolution::Error)?;
+                        reference_tracker.add_reference(target, ReferenceSource::Instruction(instr.address()), DataRefType::Code, SourceConflictResolution::Error)?;
                         finish_basic_block(instr.address(), vec![target, instr.address()+4]);
                     }
                     "ret" => {
@@ -162,8 +162,8 @@ impl TextSegment {
                     } else {
                         SourceConflictResolution::Error
                     };
-                    reference_tracker.add_reference(((adrp.target as i64) + offset) as u64, source_offset, ref_type, source_conflict_resolution)?;
-                    reference_tracker.add_reference(((adrp.target as i64) + offset) as u64, adrp.location, ref_type, SourceConflictResolution::KeepFirst)?;
+                    reference_tracker.add_reference(((adrp.target as i64) + offset) as u64, ReferenceSource::Instruction(source_offset), ref_type, source_conflict_resolution)?;
+                    reference_tracker.add_reference(((adrp.target as i64) + offset) as u64, ReferenceSource::Instruction(adrp.location), ref_type, SourceConflictResolution::KeepFirst)?;
                     adrp.has_been_used = true;  // mark as used within this block
                 } else if !block.destroyed_regs.contains(&src_reg) {
                     block.potential_refs.push(PotentialRef {
@@ -312,8 +312,8 @@ impl TextSegment {
                         } else {
                             SourceConflictResolution::Error
                         };
-                        reference_tracker.add_reference(((adrp.target as i64) + pref.offset) as u64, pref.source_offset, pref.ref_type, source_conflict_resolution)?;
-                        reference_tracker.add_reference(((adrp.target as i64) + pref.offset) as u64, adrp.location, pref.ref_type, SourceConflictResolution::KeepFirst)?;
+                        reference_tracker.add_reference(((adrp.target as i64) + pref.offset) as u64, ReferenceSource::Instruction(pref.source_offset), pref.ref_type, source_conflict_resolution)?;
+                        reference_tracker.add_reference(((adrp.target as i64) + pref.offset) as u64, ReferenceSource::Instruction(adrp.location), pref.ref_type, SourceConflictResolution::KeepFirst)?;
                         //println!("Resolved reference at 0x{:X} using ADRP at 0x{:X}", pref.source_offset, adrp.location);
                         found = true;
                     }
@@ -394,7 +394,7 @@ impl TextSegment {
             }
             let detail = cs.insn_detail(&instr)
                 .or_else(|e| bail!("Failed to get instruction detail: {}", e))?;
-            let reference_target = reference_tracker.get_reference_from(instr.address())
+            let reference_target = reference_tracker.get_reference_from(ReferenceSource::Instruction(instr.address()))
                 .ok_or(anyhow::anyhow!("No reference found for instruction at 0x{:X}", instr.address()))
                 .map(|(_, target)| target);
 
