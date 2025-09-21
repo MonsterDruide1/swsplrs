@@ -8,6 +8,7 @@ anyhow = "1.0.99"
 argh = "0.1.13"
 binrw = "0.15.0"
 capstone = { git = "https://github.com/capstone-rust/capstone-rs", rev = "85534a97ca7b5f8cc0abe2fea4d42fded803214d" }
+indicatif = "0.18.0"
 lz4_flex = "0.11.5"
 num_enum = "0.7.4"
 rangemap = { git = "https://github.com/MonsterDruide1/rangemap", rev = "33f917cb34feb89aca87ff01df8a8411fee3ce08" }

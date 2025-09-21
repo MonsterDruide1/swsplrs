@@ -3,6 +3,7 @@ use std::{collections::{HashMap, HashSet}, fs::File, io::Cursor, path::Path, u64
 use anyhow::{bail, ensure, Result};
 use binrw::{binread, BinRead};
 use capstone::{self, arch::{arm64::{Arm64Operand, Arm64OperandType, Arm64Reg}, ArchOperand, BuildsCapstone, BuildsCapstoneEndian}, InsnGroupId, RegId};
+use indicatif::{MultiProgress, ProgressBar, ProgressIterator, ProgressStyle};
 use rangemap::RangeMap;
 
 use crate::nso::nso::{DataRefType, ReferenceTracker};
@@ -22,7 +23,7 @@ impl TextSegment {
         Self { module, section, section_offset }
     }
 
-    pub fn collect_references(&self, mut reference_tracker: &mut ReferenceTracker) -> anyhow::Result<()> {
+    pub fn collect_references(&self, mut reference_tracker: &mut ReferenceTracker, mpb: &Option<MultiProgress>) -> anyhow::Result<()> {
         let cs = construct_capstone()?;
 
         #[derive(Debug, Clone)]
@@ -65,7 +66,14 @@ impl TextSegment {
                 current_start = end;
             };
 
+            let pb = mpb.as_ref().map(|m|
+                m.add(ProgressBar::new((self.section.len() - self.section_offset) as u64))
+                    .with_prefix("   [1/2] Discovering basic blocks:")
+                    .with_style(ProgressStyle::with_template("{prefix} {wide_bar} {binary_bytes}/{binary_total_bytes}  ").unwrap())
+            );
+
             while let Some(instr) = iter.next() {
+                pb.as_ref().map(|p| p.inc(4));
                 let Some(mnemonic) = instr.mnemonic() else {
                     bail!("Instruction at 0x{:X} has no mnemonic", instr.address());
                 };
@@ -120,9 +128,14 @@ impl TextSegment {
                 }
             }
 
+            if let Some(pb) = pb {
+                pb.set_style(ProgressStyle::with_template("{prefix} {msg}").unwrap());
+                pb.finish_with_message("done");
+            }
+
             // iterate over all blocks again, check their "next" references and split blocks if necessary
             let nexts: Vec<u64> = blocks.iter().flat_map(|(_, b)| b.next_blocks.clone()).collect();
-            for next in nexts {
+            for next in nexts.into_iter() {
                 if let Some((range, _)) = blocks.get_key_value(&next) && range.start != next {
                     //println!("Splitting existing block 0x{:X} to 0x{:X} at 0x{:X}, overwriting from 0x{:X} to 0x{:X}", range.start, range.end, next, range.start, next);
                     blocks.insert(range.start..next, BasicBlock {
@@ -160,8 +173,15 @@ impl TextSegment {
 
             let mut iter = cs.disasm_iter(&self.section, self.section_offset as u64)
                 .or_else(|e| bail!("Failed to disassemble text segment: {}", e))?;
+
+            let pb = mpb.as_ref().map(|m|
+                m.add(ProgressBar::new((self.section.len() - self.section_offset) as u64))
+                    .with_prefix("   [2/2] Analyzing basic blocks:")
+                    .with_style(ProgressStyle::with_template("{prefix} {wide_bar} {binary_bytes}/{binary_total_bytes}  ").unwrap())
+            );
             
             while let Some(instr) = iter.next() {
+                pb.as_ref().map(|p| p.inc(4));
                 let Some(mnemonic) = instr.mnemonic() else {
                     bail!("Instruction at 0x{:X} has no mnemonic", instr.address());
                 };
@@ -256,6 +276,11 @@ impl TextSegment {
                     current_block.adrp_targets_at_end.retain(|reg, _| !destroyed_regs.contains(reg));
                 }
             }
+
+            if let Some(pb) = pb {
+                pb.set_style(ProgressStyle::with_template("{prefix} {msg}").unwrap());
+                pb.finish_with_message("done");
+            }
         }
 
         // global analysis: propagate `ADRP` targets through blocks, resolve potential references
@@ -307,7 +332,7 @@ impl TextSegment {
         Ok(format!("loc_{:X}", address))
     }
 
-    pub fn export_asm(&self, path: impl AsRef<Path>, reference_tracker: &ReferenceTracker) -> Result<()> {
+    pub fn export_asm(&self, path: impl AsRef<Path>, reference_tracker: &ReferenceTracker, mpb: &Option<MultiProgress>) -> Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
         let cs = construct_capstone()?;
@@ -315,8 +340,15 @@ impl TextSegment {
         let mut iter = cs.disasm_iter(&self.section, self.section_offset as u64)
             .or_else(|e| bail!("Failed to disassemble text segment: {}", e))?;
         
+        let pb = mpb.as_ref().map(|m|
+            m.add(ProgressBar::new((self.section.len() - self.section_offset) as u64))
+                .with_prefix("   [1/1] Exporting .text:")
+                .with_style(ProgressStyle::with_template("{prefix} {wide_bar} {binary_bytes}/{binary_total_bytes}  ").unwrap())
+        );
+
         // TODO .fill {dist}, 1, 0 ???
         while let Some(instr) = iter.next() {
+            pb.as_ref().map(|p| p.inc(4));
             if reference_tracker.get_references_to(instr.address()).is_some() {
                 // TODO potentially mark as `.global {sym}`
                 writeln!(file, "{}:", self.get_symbol(instr.address())?)?;
@@ -377,7 +409,7 @@ impl TextSegment {
                     let base_reg_name = cs.reg_name(base_reg)
                         .ok_or_else(|| anyhow::anyhow!("Failed to get register name for {:?}", base_reg))?;
                     if let Ok(target) = reference_target {
-                        println!("Reference found for memory operand at 0x{:X} to 0x{:X}", instr.address(), target);
+                        //println!("Reference found for memory operand at 0x{:X} to 0x{:X}", instr.address(), target);
                         writeln!(file, "\t{} {}, [{}, :lo12:{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, self.get_symbol(target)?)?;
                     } else {
                         writeln!(file, "\t{} {}, [{}, #{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, get_operand_mem(&detail, 1)?.disp())?;
@@ -388,6 +420,12 @@ impl TextSegment {
                 }
             }
         }
+
+        if let Some(pb) = pb {
+            pb.set_style(ProgressStyle::with_template("{prefix} {msg}").unwrap());
+            pb.finish_with_message("done");
+        }
+
         Ok(())
     }
 }

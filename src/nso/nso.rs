@@ -1,7 +1,8 @@
-use std::{collections::HashMap, fs::{self, File}, io::Cursor, path::Path};
+use std::{collections::HashMap, fs::{self, File}, io::Cursor, path::Path, time::Duration};
 
 use anyhow::{bail, ensure, Result};
 use binrw::{binread, BinRead, BinReaderExt, NullString};
+use indicatif::{MultiProgress, ProgressStyle};
 use num_enum::TryFromPrimitive;
 
 use crate::nso::{nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}};
@@ -78,18 +79,64 @@ impl NSO {
         })
     }
 
-    pub fn export_all(&self, path: &Path) -> anyhow::Result<()> {
+    pub fn export_all(&self, path: &Path, no_progress: bool) -> anyhow::Result<()> {
         fs::create_dir_all(path)?;
         let helper = NsoLookupHelper::new(self)?;
         let mut reference_tracker = ReferenceTracker::new();
 
-        self.ref_types_got_plt(&mut reference_tracker)?;
-        self.ref_types_got(&mut reference_tracker, &helper)?;
-        self.file.text.collect_references(&mut reference_tracker)?;
+        fn call_with_progress(
+            m: &Option<MultiProgress>, name: &str, index: usize, total: usize,
+            reference_tracker: &mut ReferenceTracker,
+            f: impl FnOnce(&mut ReferenceTracker, &Option<MultiProgress>) -> anyhow::Result<()>
+        ) -> anyhow::Result<()> {
+            let pb = m.as_ref().map(|m| {
+                let pb = m.add(indicatif::ProgressBar::new_spinner())
+                    .with_style(ProgressStyle::with_template("{prefix} {spinner} {msg}").unwrap())
+                    .with_prefix(format!("  [{}/{}]", index, total))
+                    .with_message(format!("{}: working...", name));
+                pb.enable_steady_tick(Duration::from_millis(50));
+                pb
+            });
 
-        self.export_got_plt(path.join("got.plt.s"))?;
-        self.export_got(path.join("got.s"), &helper)?;
-        self.file.text.export_asm(path.join("text.s"), &reference_tracker)?;
+            f(reference_tracker, m)?;
+
+            if let Some(pb) = &pb {
+                pb.finish_with_message(format!("{}: done", name));
+            }
+
+            Ok(())
+        }
+
+        let collect_references: Vec<(&str, Box<dyn FnMut(&mut ReferenceTracker, &Option<MultiProgress>) -> anyhow::Result<()>>)> = vec![
+            (".got.plt", Box::new(|r,_| self.ref_types_got_plt(r))),
+            (".got", Box::new(|r,_| self.ref_types_got(r, &helper))),
+            (".text", Box::new(|r,m| self.file.text.collect_references(r, &m))),
+        ];
+        let total_collect_references = collect_references.len();
+
+        let m = if no_progress { None } else {
+            println!(" Step 1 / 2: Collecting references...");
+            Some(MultiProgress::new())
+        };
+        for (i, (name, f)) in collect_references.into_iter().enumerate() {
+            call_with_progress(&m, name, i+1, total_collect_references, &mut reference_tracker, f)?;
+        }
+
+        let export_sections: Vec<(&str, Box<dyn FnMut(&mut ReferenceTracker, &Option<MultiProgress>) -> anyhow::Result<()>>)> = vec![
+            (".got.plt", Box::new(|_,_| self.export_got_plt(path.join("got.plt.s")))),
+            (".got", Box::new(|_,_| self.export_got(path.join("got.s"), &helper))),
+            (".text", Box::new(|r,m| self.file.text.export_asm(path.join("text.s"), r, m))),
+        ];
+        let total_export_sections = export_sections.len();
+
+        let m = if no_progress { None } else {
+            println!(" Step 2 / 2: Exporting assembly...");
+            Some(MultiProgress::new())
+        };
+        for (i, (name, f)) in export_sections.into_iter().enumerate() {
+            call_with_progress(&m, name, i+1, total_export_sections, &mut reference_tracker, f)?;
+        }
+
         Ok(())
     }
 
