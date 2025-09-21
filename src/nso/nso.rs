@@ -129,6 +129,7 @@ impl NSO {
             //(".text", Box::new(|r,m| self.file.text.export_asm(path.join("text.s"), r, m, &self))),
             //(".bss", Box::new(|r,m| self.export_bss(path.join("bss.s"), r, m))),
             (".data", Box::new(|r,m| self.export_data(path.join("data.s"), r, m))),
+            (".rodata", Box::new(|r,m| self.export_rodata(path.join("rodata.s"), r, m))),
         ];
         let total_export_sections = export_sections.len();
 
@@ -221,10 +222,7 @@ impl NSO {
         let str_data = &rodata_segment[dynstr_offset as usize .. (dynstr_offset + dynstr_size) as usize];
         let mut cursor = Cursor::new(str_data);
         let mut strings = HashMap::new();
-        loop {
-            if cursor.position() as usize >= str_data.len() {
-                break;
-            }
+        while (cursor.position() as usize) < str_data.len() {
             strings.insert(cursor.position(), cursor.read_le::<NullString>()?.to_string());
         }
         Ok(strings)
@@ -360,24 +358,44 @@ impl NSO {
     }
 
     fn export_data(&self, path: impl AsRef<Path>, reference_tracker: &mut ReferenceTracker, m: &Option<MultiProgress>) -> anyhow::Result<()> {
+        self.export_data_section(
+            path,
+            ".data",
+            &self.file.data_segment,
+            self.file.text.module.dyn_offset as u64 - self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64,
+            self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64,
+            reference_tracker, m
+        )
+    }
+
+    fn export_rodata(&self, path: impl AsRef<Path>, reference_tracker: &mut ReferenceTracker, m: &Option<MultiProgress>) -> anyhow::Result<()> {
+        self.export_data_section(path,
+            ".rodata",
+            &self.file.rodata_segment,
+            self.file.header.embed_offset as u64 - self.file.header.dynstr_size as u64,
+            self.file.header.get_segment_mem_offset(&NsoSegment::Rodata) as u64 + self.file.header.dynstr_size as u64,
+            reference_tracker, m
+        )
+    }
+
+    fn export_data_section(&self, path: impl AsRef<Path>, name: &str, data: &Vec<u8>, size: u64, offset: u64, reference_tracker: &mut ReferenceTracker, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
-        writeln!(file, ".section \".data\"")?;
+        writeln!(file, ".section \"{}\"", name)?;
         writeln!(file, "")?;
 
-        let data_size = self.file.text.module.dyn_offset as u64 - self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64;
         let pb = m.as_ref().map(|m|
-            m.add(ProgressBar::new(data_size))
-                .with_prefix("   [1/1] Exporting .data:")
+            m.add(ProgressBar::new(size))
+                .with_prefix(format!("   [1/1] Exporting {}", name))
                 .with_style(ProgressStyle::with_template("{prefix} {wide_bar} {binary_bytes}/{binary_total_bytes}  ").unwrap())
         );
 
-        let mut cursor = Cursor::new(&self.file.data_segment);
-        while cursor.position() < data_size {
+        let mut cursor = Cursor::new(data);
+        while cursor.position() < size {
             pb.as_ref().map(|p| p.set_position(cursor.position()));
             
             // TODO: if outgoing reference, format as .quad
-            let data_entry_offset = self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64 + cursor.position();
+            let data_entry_offset = offset + cursor.position();
             if let Some((data_type, _)) = reference_tracker.get_references_to(data_entry_offset) {
                 let symbol = self.get_symbol(data_entry_offset)?;
                 writeln!(file, ".global {}", symbol)?;
@@ -390,10 +408,17 @@ impl NSO {
                         writeln!(file, "\t.quad 0x{:016X}", cursor.read_le::<u64>()?)?;
                     }
                     DataRefType::Float32 => {
+                        // TODO might require some special encoding/representation for assembler
                         writeln!(file, "\t.float {}", cursor.read_le::<f32>()?)?;
                     }
                     DataRefType::Float64 => {
+                        // TODO might require some special encoding/representation for assembler
                         writeln!(file, "\t.double {}", cursor.read_le::<f64>()?)?;
+                    }
+                    DataRefType::Float128 => {
+                        for _ in 0..16 {
+                            writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?;
+                        }
                     }
                     DataRefType::Code => {
                         writeln!(file, "\t.quad {}", self.get_symbol(cursor.read_le::<u64>()?)?)?;
