@@ -108,8 +108,7 @@ impl NSO {
         }
 
         let collect_references: Vec<(&str, Box<dyn FnMut(&mut ReferenceTracker, &Option<MultiProgress>) -> anyhow::Result<()>>)> = vec![
-            (".got.plt", Box::new(|r,_| self.ref_types_got_plt(r))),
-            (".got", Box::new(|r,_| self.ref_types_got(r, &helper))),
+            (".rela.dyn", Box::new(|r,_| self.ref_types_relocations(r))),
             (".text", Box::new(|r,m| self.file.text.collect_references(r, &m))),
         ];
         let total_collect_references = collect_references.len();
@@ -232,6 +231,19 @@ impl NSO {
         Ok(plt_entries)
     }
 
+    fn ref_types_relocations(&self, reference_tracker: &mut ReferenceTracker) -> anyhow::Result<()> {
+        for relocation in self.reloc_dyn_table.iter() {
+            match relocation.reloc_type {
+                RelocationType::R_AARCH64_GLOB_DAT | RelocationType::R_AARCH64_ABS64 => {}
+                RelocationType::R_AARCH64_RELATIVE => {
+                    reference_tracker.add_reference(relocation.addend as u64, relocation.offset, DataRefType::Unknown)?;
+                }
+                _ => bail!("Unsupported relocation type {:?} in .rela.dyn", relocation.reloc_type),
+            }
+        }
+        Ok(())
+    }
+
     fn export_got_plt(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
@@ -297,31 +309,6 @@ impl NSO {
                 _ => bail!("Unsupported relocation type {:?} in .got", entry.reloc_type),
             }
             writeln!(file, "")?;
-        }
-
-        Ok(())
-    }
-
-    fn ref_types_got_plt(&self, _reference_tracker: &mut ReferenceTracker) -> anyhow::Result<()> {
-        // .got.plt only references functions outside of this binary
-        Ok(())
-    }
-
-    fn ref_types_got(&self, reference_tracker: &mut ReferenceTracker, helper: &NsoLookupHelper) -> anyhow::Result<()> {
-        for i in 0..self.got_metadata.count {
-            let got_entry_offset = self.got_metadata.start_offset + i * 8;
-            let Some(entry_index) = helper.reloc_dyn_addr_to_idx.get(&got_entry_offset) else {
-                continue;
-            };
-            let entry = &self.reloc_dyn_table[*entry_index];
-
-            match entry.reloc_type {
-                RelocationType::R_AARCH64_GLOB_DAT | RelocationType::R_AARCH64_ABS64 => {}
-                RelocationType::R_AARCH64_RELATIVE => {
-                    reference_tracker.add_reference(entry.addend as u64, got_entry_offset, DataRefType::Unknown)?;
-                }
-                _ => bail!("Unsupported relocation type {:?} in .got", entry.reloc_type),
-            }
         }
 
         Ok(())

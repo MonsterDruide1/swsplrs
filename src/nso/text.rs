@@ -361,7 +361,9 @@ impl TextSegment {
                 if instr.bytes() == [0xFE, 0xDE, 0xFF, 0xE7] {
                     writeln!(file, "\ttrap")?;
                 } else {
-                    writeln!(file, "    .byte {}", instr.bytes().iter().map(|b| format!("0x{:02X}", b)).collect::<Vec<_>>().join(", "))?;
+                    for b in instr.bytes() {
+                        writeln!(file, "\t.byte 0x{:02X}", b)?;
+                    }
                 }
                 continue;
             }
