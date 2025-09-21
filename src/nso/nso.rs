@@ -243,7 +243,7 @@ impl NSO {
             match relocation.reloc_type {
                 RelocationType::R_AARCH64_GLOB_DAT | RelocationType::R_AARCH64_ABS64 => {}
                 RelocationType::R_AARCH64_RELATIVE => {
-                    reference_tracker.add_reference(relocation.addend as u64, relocation.offset, DataRefType::Unknown)?;
+                    reference_tracker.add_reference(relocation.addend as u64, relocation.offset, DataRefType::Unknown, SourceConflictResolution::Error)?;
                 }
                 _ => bail!("Unsupported relocation type {:?} in .rela.dyn", relocation.reloc_type),
             }
@@ -350,7 +350,7 @@ impl NSO {
             pb.set_style(ProgressStyle::with_template("{prefix} {msg}").unwrap());
             pb.finish_with_message("done");
         }
-        
+
         Ok(())
     }
 }
@@ -527,10 +527,16 @@ pub enum DataRefType {
     Float128,
     Unknown,
 }
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum SourceConflictResolution {
+    Error,  // no conflicts should happen => fail when it does
+    KeepFirst,  // keep the first reference type found, ignore all others (used for `adrp`)
+    BlockSource,  // delete existing reference and prevent future references from the same source (used for `adrp` + `add`/`ldr`)
+}
 
 pub struct ReferenceTracker {
     pub references_by_target: HashMap<u64, (DataRefType, Vec<u64>)>,  // target -> (type, sources)
-    pub references_by_source: HashMap<u64, u64>,  // source -> target
+    pub references_by_source: HashMap<u64, (u64, SourceConflictResolution)>,  // source -> (target, resolution)
 }
 impl ReferenceTracker {
     pub fn new() -> Self {
@@ -540,7 +546,7 @@ impl ReferenceTracker {
         }
     }
 
-    pub fn add_reference(&mut self, target: u64, source: u64, data_type: DataRefType) -> Result<()> {
+    pub fn add_reference(&mut self, target: u64, source: u64, data_type: DataRefType, source_conflict_resolution: SourceConflictResolution) -> Result<()> {
         if let Some((existing_type, sources)) = self.references_by_target.get_mut(&target) {
             if data_type != *existing_type {
                 *existing_type = std::cmp::min(data_type, *existing_type);
@@ -549,8 +555,23 @@ impl ReferenceTracker {
         } else {
             self.references_by_target.insert(target, (data_type, vec![source]));
         }
-        let old = self.references_by_source.insert(source, target);
-        ensure!(old.is_none_or(|old| old == target), "Source 0x{:X} already references target 0x{:X}, now tries to reference 0x{:X}", source, old.unwrap(), target);
+        if let Some((old, old_resolution)) = self.references_by_source.get(&source) && *old != target {
+            ensure!(*old_resolution == source_conflict_resolution, "Source conflict resolution for source 0x{:X} changed from {:?} to {:?}", source, old_resolution, source_conflict_resolution);
+            match source_conflict_resolution {
+                SourceConflictResolution::Error => bail!("Source 0x{:X} already references target 0x{:X}, now tries to reference 0x{:X}", source, old, target),
+                SourceConflictResolution::KeepFirst => {},
+                SourceConflictResolution::BlockSource => {
+                    self.references_by_source.insert(source, (u64::MAX, source_conflict_resolution));  // mark as blocked
+                    // iterate over all targets and remove this source, as `KeepFirst` might have added it to multiple targets
+                    for (_, (_, sources)) in self.references_by_target.iter_mut() {
+                        sources.retain(|s| *s != source);
+                        // keep empty targets, they might be useful for typing
+                    }
+                },
+            }
+        } else {
+            self.references_by_source.insert(source, (target, source_conflict_resolution));
+        }
         Ok(())
     }
 
@@ -559,7 +580,7 @@ impl ReferenceTracker {
     }
 
     pub fn get_reference_from(&self, source: u64) -> Option<(DataRefType, u64)> {
-        if let Some(target) = self.references_by_source.get(&source) {
+        if let Some((target, _)) = self.references_by_source.get(&source) {
             if let Some((data_type, _)) = self.references_by_target.get(target) {
                 return Some((*data_type, *target));
             }
