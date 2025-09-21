@@ -244,7 +244,9 @@ impl NSO {
     fn ref_types_relocations(&self, reference_tracker: &mut ReferenceTracker) -> anyhow::Result<()> {
         for relocation in self.reloc_dyn_table.iter() {
             match relocation.reloc_type {
-                RelocationType::R_AARCH64_GLOB_DAT | RelocationType::R_AARCH64_ABS64 => {}
+                RelocationType::R_AARCH64_GLOB_DAT | RelocationType::R_AARCH64_ABS64 => {
+                    reference_tracker.add_reference(self.symbol_table[relocation.sym_idx as usize].value, relocation.offset, DataRefType::Unknown, SourceConflictResolution::Error)?;
+                }
                 RelocationType::R_AARCH64_RELATIVE => {
                     reference_tracker.add_reference(relocation.addend as u64, relocation.offset, DataRefType::Unknown, SourceConflictResolution::Error)?;
                 }
