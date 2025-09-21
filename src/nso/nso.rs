@@ -2,7 +2,7 @@ use std::{collections::HashMap, fs::{self, File}, io::Cursor, path::Path, time::
 
 use anyhow::{bail, ensure, Result};
 use binrw::{binread, BinRead, BinReaderExt, NullString};
-use indicatif::{MultiProgress, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use num_enum::TryFromPrimitive;
 
 use crate::nso::{nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}};
@@ -124,7 +124,8 @@ impl NSO {
         let export_sections: Vec<(&str, Box<dyn FnMut(&mut ReferenceTracker, &Option<MultiProgress>) -> anyhow::Result<()>>)> = vec![
             (".got.plt", Box::new(|_,_| self.export_got_plt(path.join("got.plt.s")))),
             (".got", Box::new(|_,_| self.export_got(path.join("got.s"), &helper))),
-            (".text", Box::new(|r,m| self.file.text.export_asm(path.join("text.s"), r, m))),
+            //(".text", Box::new(|r,m| self.file.text.export_asm(path.join("text.s"), r, m, &self))),
+            (".bss", Box::new(|r,m| self.export_bss(path.join("bss.s"), r, m))),
         ];
         let total_export_sections = export_sections.len();
 
@@ -138,6 +139,12 @@ impl NSO {
 
         Ok(())
     }
+
+    pub fn get_symbol(&self, address: u64) -> Result<String> {
+        // TODO potentially use symbol name, otherwise fallback to {.text: loc_X, .data/.rodata/.bss: off_X}
+        Ok(format!("loc_{:X}", address))
+    }
+
 
     fn parse_buildstr(data: &mut Cursor<&Vec<u8>>) -> Result<String> {
         let zeros: [u8; 4] = data.read_le()?;
@@ -311,6 +318,39 @@ impl NSO {
             writeln!(file, "")?;
         }
 
+        Ok(())
+    }
+
+    fn export_bss(&self, path: impl AsRef<Path>, reference_tracker: &mut ReferenceTracker, m: &Option<MultiProgress>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \".bss\"")?;
+        writeln!(file, "")?;
+
+        let bss_size = (self.file.text.module.bss_end - self.file.text.module.bss_start) as u64;
+        let pb = m.as_ref().map(|m|
+            m.add(ProgressBar::new(bss_size))
+                .with_prefix("   [1/1] Exporting .bss:")
+                .with_style(ProgressStyle::with_template("{prefix} {wide_bar} {binary_bytes}/{binary_total_bytes}  ").unwrap())
+        );
+
+        for i in 0..bss_size {
+            pb.as_ref().map(|p| p.inc(1));
+
+            let bss_entry_offset = self.file.text.module.bss_start as u64 + i;
+            if let Some(_) = reference_tracker.get_references_to(bss_entry_offset) {
+                let symbol = self.get_symbol(bss_entry_offset)?;
+                writeln!(file, ".global {}", symbol)?;
+                writeln!(file, "{}:", symbol)?;
+            };
+            writeln!(file, "\t.skip 1")?;
+        }
+
+        if let Some(pb) = pb {
+            pb.set_style(ProgressStyle::with_template("{prefix} {msg}").unwrap());
+            pb.finish_with_message("done");
+        }
+        
         Ok(())
     }
 }

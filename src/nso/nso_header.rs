@@ -13,7 +13,6 @@ struct NsoSegmentMetadata {
     file_offset: u32,
     mem_offset: u32,
     mem_size: u32,
-    align: u32,
 }
 
 #[binread]
@@ -27,8 +26,11 @@ pub struct NsoHeader {
     pub flags: u32,
 
     text_segment: NsoSegmentMetadata,
+    pub text_align: u32,
     rodata_segment: NsoSegmentMetadata,
+    pub rodata_align: u32,
     data_segment: NsoSegmentMetadata,
+    pub bss_size: u32,
 
     pub module_id: [u8; 0x20],
 

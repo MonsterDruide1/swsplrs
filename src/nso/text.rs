@@ -3,10 +3,10 @@ use std::{collections::{HashMap, HashSet}, fs::File, io::Cursor, path::Path, u64
 use anyhow::{bail, ensure, Result};
 use binrw::{binread, BinRead};
 use capstone::{self, arch::{arm64::{Arm64Operand, Arm64OperandType, Arm64Reg}, ArchOperand, BuildsCapstone, BuildsCapstoneEndian}, InsnGroupId, RegId};
-use indicatif::{MultiProgress, ProgressBar, ProgressIterator, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rangemap::RangeMap;
 
-use crate::nso::nso::{DataRefType, ReferenceTracker};
+use crate::nso::nso::{DataRefType, ReferenceTracker, NSO};
 
 pub struct TextSegment {
     pub module: Module,
@@ -327,12 +327,7 @@ impl TextSegment {
         Ok(())
     }
 
-    fn get_symbol(&self, address: u64) -> Result<String> {
-        // TODO potentially use symbol name, otherwise fallback to loc_{address}
-        Ok(format!("loc_{:X}", address))
-    }
-
-    pub fn export_asm(&self, path: impl AsRef<Path>, reference_tracker: &ReferenceTracker, mpb: &Option<MultiProgress>) -> Result<()> {
+    pub fn export_asm(&self, path: impl AsRef<Path>, reference_tracker: &ReferenceTracker, mpb: &Option<MultiProgress>, parent: &NSO) -> Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
         let cs = construct_capstone()?;
@@ -351,7 +346,7 @@ impl TextSegment {
             pb.as_ref().map(|p| p.inc(4));
             if reference_tracker.get_references_to(instr.address()).is_some() {
                 // TODO potentially mark as `.global {sym}`
-                writeln!(file, "{}:", self.get_symbol(instr.address())?)?;
+                writeln!(file, "{}:", parent.get_symbol(instr.address())?)?;
             }
 
             let Some(mnemonic) = instr.mnemonic() else {
@@ -377,28 +372,28 @@ impl TextSegment {
                 // branching/jumps/calls
                 //  blr, br, ret remain unchanged
                 "bl" | "b" => {
-                    writeln!(file, "\t{} {}", mnemonic, self.get_symbol(reference_target?)?)?;
+                    writeln!(file, "\t{} {}", mnemonic, parent.get_symbol(reference_target?)?)?;
                 }
                 "tbz" | "tbnz" => {
-                    writeln!(file, "\t{} {}, #{}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_imm(&detail, 1)?, self.get_symbol(reference_target?)?)?;
+                    writeln!(file, "\t{} {}, #{}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_imm(&detail, 1)?, parent.get_symbol(reference_target?)?)?;
                 }
                 "cbz" | "cbnz" => {
-                    writeln!(file, "\t{} {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, self.get_symbol(reference_target?)?)?;
+                    writeln!(file, "\t{} {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, parent.get_symbol(reference_target?)?)?;
                 }
                 s if s.starts_with("b.") => {  // conditionals with b (b.eq, b.ne, b.lt, ...)
-                    writeln!(file, "\t{} {}", mnemonic, self.get_symbol(reference_target?)?)?;
+                    writeln!(file, "\t{} {}", mnemonic, parent.get_symbol(reference_target?)?)?;
                 }
 
                 // loads/stores
                 "adr" => {bail!("Unhandled adr instruction at 0x{:X}", instr.address());}
                 "adrp" => {
-                    writeln!(file, "\t{} {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, self.get_symbol(reference_target?)?)?;
+                    writeln!(file, "\t{} {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, parent.get_symbol(reference_target?)?)?;
                 }
                 "add" => {
                     // we are only interested in adds with last operand being an immediate (=> offset)
                     if let Ok(_) = get_operand_imm(&detail, 2) {
                         if let Ok(target) = reference_target {
-                            writeln!(file, "\t{} {}, {}, :lo12:{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, self.get_symbol(target)?)?;
+                            writeln!(file, "\t{} {}, {}, :lo12:{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, parent.get_symbol(target)?)?;
                         } else {
                             writeln!(file, "\t{} {}, {}, #{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, get_operand_imm(&detail, 2)?)?;
                         }
@@ -412,7 +407,7 @@ impl TextSegment {
                         .ok_or_else(|| anyhow::anyhow!("Failed to get register name for {:?}", base_reg))?;
                     if let Ok(target) = reference_target {
                         //println!("Reference found for memory operand at 0x{:X} to 0x{:X}", instr.address(), target);
-                        writeln!(file, "\t{} {}, [{}, :lo12:{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, self.get_symbol(target)?)?;
+                        writeln!(file, "\t{} {}, [{}, :lo12:{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, parent.get_symbol(target)?)?;
                     } else {
                         writeln!(file, "\t{} {}, [{}, #{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, get_operand_mem(&detail, 1)?.disp())?;
                     }
