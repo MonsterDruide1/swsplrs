@@ -68,7 +68,7 @@ impl TextSegment {
 
             let pb = mpb.as_ref().map(|m|
                 m.add(ProgressBar::new((self.section.len() - self.section_offset) as u64))
-                    .with_prefix("   [1/2] Discovering basic blocks:")
+                    .with_prefix("   [1/3] Discovering basic blocks:")
                     .with_style(ProgressStyle::with_template("{prefix} {wide_bar} {binary_bytes}/{binary_total_bytes}  ").unwrap())
             );
 
@@ -181,7 +181,7 @@ impl TextSegment {
 
             let pb = mpb.as_ref().map(|m|
                 m.add(ProgressBar::new((self.section.len() - self.section_offset) as u64))
-                    .with_prefix("   [2/2] Analyzing basic blocks:")
+                    .with_prefix("   [2/3] Analyzing basic blocks:")
                     .with_style(ProgressStyle::with_template("{prefix} {wide_bar} {binary_bytes}/{binary_total_bytes}  ").unwrap())
             );
             
@@ -326,8 +326,15 @@ impl TextSegment {
                 Ok(found)
             }
 
+            let pb = mpb.as_ref().map(|m|
+                m.add(ProgressBar::new(blocks.len() as u64))
+                    .with_prefix("   [3/3] Connecting basic blocks:")
+                    .with_style(ProgressStyle::with_template("{prefix} {wide_bar} {pos}/{len}  ").unwrap())
+            );
+            
             let mut visited_blocks = HashSet::<u64>::new();  // visited blocks
             for (range, block) in blocks.iter() {
+                pb.as_ref().map(|p| p.inc(1));
                 //println!("Propagating ADRPs for block 0x{:X}-0x{:X}: {:?}", range.start, range.end, block);
                 for (reg, adrp) in block.adrp_targets_at_end.iter() {
                     let mut found = adrp.has_been_used;
@@ -338,6 +345,11 @@ impl TextSegment {
                     ensure!(found, "ADRP target at 0x{:X} in register {:?} in block 0x{:X}-0x{:X} could not be propagated to any reference", adrp.target, reg, range.start, range.end);
                     visited_blocks.clear();
                 }
+            }
+
+            if let Some(pb) = pb {
+                pb.set_style(ProgressStyle::with_template("{prefix} {msg}").unwrap());
+                pb.finish_with_message("done");
             }
         }
         // TODO: repeat check in other direction? Double-verify references by going backwards and checking that ref can always be resolved
