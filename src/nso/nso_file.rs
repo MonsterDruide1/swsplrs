@@ -55,4 +55,10 @@ impl NsoFile {
 
         Ok(buffer)
     }
+
+    pub fn is_address_in_segment(&self, address: u64, segment: &NsoSegment) -> bool {
+        let start = self.header.get_segment_mem_offset(segment) as u64;
+        let end = start + self.header.get_segment_mem_size(segment) as u64;
+        address >= start && address < end
+    }
 }

@@ -126,10 +126,10 @@ impl NSO {
         let export_sections: Vec<(&str, Box<dyn FnMut(&mut ReferenceTracker, &Option<MultiProgress>) -> anyhow::Result<()>>)> = vec![
             (".got.plt", Box::new(|_,_| self.export_got_plt(path.join("got.plt.s")))),
             (".got", Box::new(|_,_| self.export_got(path.join("got.s"), &helper))),
-            //(".text", Box::new(|r,m| self.file.text.export_asm(path.join("text.s"), r, m, &self))),
-            //(".bss", Box::new(|r,m| self.export_bss(path.join("bss.s"), r, m))),
-            (".data", Box::new(|r,m| self.export_data(path.join("data.s"), r, m))),
-            (".rodata", Box::new(|r,m| self.export_rodata(path.join("rodata.s"), r, m))),
+            (".text", Box::new(|r,m| self.file.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
+            (".bss", Box::new(|r,m| self.export_bss(path.join("bss.s"), r, &helper, m))),
+            (".data", Box::new(|r,m| self.export_data(path.join("data.s"), r, &helper, m))),
+            (".rodata", Box::new(|r,m| self.export_rodata(path.join("rodata.s"), r, &helper, m))),
         ];
         let total_export_sections = export_sections.len();
 
@@ -144,9 +144,21 @@ impl NSO {
         Ok(())
     }
 
-    pub fn get_symbol(&self, address: u64) -> Result<String> {
-        // TODO potentially use symbol name, otherwise fallback to {.text: loc_X, .data/.rodata/.bss: off_X}
-        Ok(format!("loc_{:X}", address))
+    pub fn get_symbol(&self, address: u64, helper: &NsoLookupHelper) -> Result<String> {
+        // if symbol exists for address, use it
+        if let Some(idx) = helper.symbol_table_value_to_idx.get(&address) {
+            let Some(name) = self.dynstr_table.get(&(self.symbol_table[*idx].str_table_offset as u64)) else {
+                bail!("Symbol at {:X} has no name", address);
+            };
+            return Ok(name.clone());
+        }
+        // otherwise use `loc_X` for .text or `off_X` for .data/.rodata/.bss
+        let prefix = if self.file.is_address_in_segment(address, &NsoSegment::Text) {
+            "loc"
+        } else {
+            "off"
+        };
+        Ok(format!("{}_{:X}", prefix, address))
     }
 
 
@@ -356,7 +368,7 @@ impl NSO {
         Ok(())
     }
 
-    fn export_bss(&self, path: impl AsRef<Path>, reference_tracker: &mut ReferenceTracker, m: &Option<MultiProgress>) -> anyhow::Result<()> {
+    fn export_bss(&self, path: impl AsRef<Path>, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
         writeln!(file, ".section \".bss\"")?;
@@ -374,7 +386,7 @@ impl NSO {
 
             let bss_entry_offset = self.file.text.module.bss_start as u64 + i;
             if let Some(_) = reference_tracker.get_references_to(bss_entry_offset) {
-                let symbol = self.get_symbol(bss_entry_offset)?;
+                let symbol = self.get_symbol(bss_entry_offset, helper)?;
                 writeln!(file, ".global {}", symbol)?;
                 writeln!(file, "{}:", symbol)?;
             }
@@ -389,28 +401,28 @@ impl NSO {
         Ok(())
     }
 
-    fn export_data(&self, path: impl AsRef<Path>, reference_tracker: &mut ReferenceTracker, m: &Option<MultiProgress>) -> anyhow::Result<()> {
+    fn export_data(&self, path: impl AsRef<Path>, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         self.export_data_section(
             path,
             ".data",
             &self.file.data_segment,
             self.file.text.module.dyn_offset as u64 - self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64,
             self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64,
-            reference_tracker, m
+            reference_tracker, helper, m
         )
     }
 
-    fn export_rodata(&self, path: impl AsRef<Path>, reference_tracker: &mut ReferenceTracker, m: &Option<MultiProgress>) -> anyhow::Result<()> {
+    fn export_rodata(&self, path: impl AsRef<Path>, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         self.export_data_section(path,
             ".rodata",
             &self.file.rodata_segment,
             self.file.header.embed_offset as u64 - self.file.header.dynstr_size as u64,
             self.file.header.get_segment_mem_offset(&NsoSegment::Rodata) as u64 + self.file.header.dynstr_size as u64,
-            reference_tracker, m
+            reference_tracker, helper, m
         )
     }
 
-    fn export_data_section(&self, path: impl AsRef<Path>, name: &str, data: &Vec<u8>, size: u64, offset: u64, reference_tracker: &mut ReferenceTracker, m: &Option<MultiProgress>) -> anyhow::Result<()> {
+    fn export_data_section(&self, path: impl AsRef<Path>, name: &str, data: &Vec<u8>, size: u64, offset: u64, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
         writeln!(file, ".section \"{}\"", name)?;
@@ -429,7 +441,7 @@ impl NSO {
             // TODO: if outgoing reference, format as .quad
             let data_entry_offset = offset + cursor.position();
             if let Some((data_type, _)) = reference_tracker.get_references_to(data_entry_offset) {
-                let symbol = self.get_symbol(data_entry_offset)?;
+                let symbol = self.get_symbol(data_entry_offset, helper)?;
                 writeln!(file, ".global {}", symbol)?;
                 writeln!(file, "{}:", symbol)?;
                 match data_type {
@@ -453,7 +465,7 @@ impl NSO {
                         }
                     }
                     DataRefType::Code => {
-                        writeln!(file, "\t.quad {}", self.get_symbol(cursor.read_le::<u64>()?)?)?;
+                        writeln!(file, "\t.quad {}", self.get_symbol(cursor.read_le::<u64>()?, helper)?)?;
                     }
                     DataRefType::Unknown => {
                         writeln!(file, "\t.quad 0x{:016X}", cursor.read_le::<u64>()?)?;
@@ -617,7 +629,7 @@ pub struct GotMetadata {
 
 
 
-struct NsoLookupHelper {
+pub struct NsoLookupHelper {
     reloc_dyn_addr_to_idx: HashMap<u64, usize>,
     symbol_table_value_to_idx: HashMap<u64, usize>,
 }
@@ -673,6 +685,7 @@ impl ReferenceTracker {
         }
     }
 
+    // TODO: rewrite this to make more heavy use of ReferenceSource (separate adrp, add, ldr) and remove `SourceConflictResolution`
     pub fn add_reference(&mut self, target: u64, source: ReferenceSource, data_type: DataRefType, source_conflict_resolution: SourceConflictResolution) -> Result<()> {
         if let Some((existing_type, sources)) = self.references_by_target.get_mut(&target) {
             if data_type != *existing_type {
