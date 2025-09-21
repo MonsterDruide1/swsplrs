@@ -107,6 +107,8 @@ impl NSO {
             Ok(())
         }
 
+        // TODO: collect references from symbol table
+        // TODO: collect references from data and rodata?
         let collect_references: Vec<(&str, Box<dyn FnMut(&mut ReferenceTracker, &Option<MultiProgress>) -> anyhow::Result<()>>)> = vec![
             (".rela.dyn", Box::new(|r,_| self.ref_types_relocations(r))),
             (".text", Box::new(|r,m| self.file.text.collect_references(r, &m))),
@@ -125,7 +127,8 @@ impl NSO {
             (".got.plt", Box::new(|_,_| self.export_got_plt(path.join("got.plt.s")))),
             (".got", Box::new(|_,_| self.export_got(path.join("got.s"), &helper))),
             //(".text", Box::new(|r,m| self.file.text.export_asm(path.join("text.s"), r, m, &self))),
-            (".bss", Box::new(|r,m| self.export_bss(path.join("bss.s"), r, m))),
+            //(".bss", Box::new(|r,m| self.export_bss(path.join("bss.s"), r, m))),
+            (".data", Box::new(|r,m| self.export_data(path.join("data.s"), r, m))),
         ];
         let total_export_sections = export_sections.len();
 
@@ -342,8 +345,67 @@ impl NSO {
                 let symbol = self.get_symbol(bss_entry_offset)?;
                 writeln!(file, ".global {}", symbol)?;
                 writeln!(file, "{}:", symbol)?;
-            };
+            }
             writeln!(file, "\t.skip 1")?;
+        }
+
+        if let Some(pb) = pb {
+            pb.set_style(ProgressStyle::with_template("{prefix} {msg}").unwrap());
+            pb.finish_with_message("done");
+        }
+
+        Ok(())
+    }
+
+    fn export_data(&self, path: impl AsRef<Path>, reference_tracker: &mut ReferenceTracker, m: &Option<MultiProgress>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \".data\"")?;
+        writeln!(file, "")?;
+
+        let data_size = self.file.text.module.dyn_offset as u64 - self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64;
+        let pb = m.as_ref().map(|m|
+            m.add(ProgressBar::new(data_size))
+                .with_prefix("   [1/1] Exporting .data:")
+                .with_style(ProgressStyle::with_template("{prefix} {wide_bar} {binary_bytes}/{binary_total_bytes}  ").unwrap())
+        );
+
+        let mut cursor = Cursor::new(&self.file.data_segment);
+        while cursor.position() < data_size {
+            pb.as_ref().map(|p| p.set_position(cursor.position()));
+            
+            // TODO: if outgoing reference, format as .quad
+            let data_entry_offset = self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64 + cursor.position();
+            if let Some((data_type, _)) = reference_tracker.get_references_to(data_entry_offset) {
+                let symbol = self.get_symbol(data_entry_offset)?;
+                writeln!(file, ".global {}", symbol)?;
+                writeln!(file, "{}:", symbol)?;
+                match data_type {
+                    DataRefType::Int32 => {
+                        writeln!(file, "\t.word 0x{:08X}", cursor.read_le::<u32>()?)?;
+                    }
+                    DataRefType::Int64 => {
+                        writeln!(file, "\t.quad 0x{:016X}", cursor.read_le::<u64>()?)?;
+                    }
+                    DataRefType::Float32 => {
+                        writeln!(file, "\t.float {}", cursor.read_le::<f32>()?)?;
+                    }
+                    DataRefType::Float64 => {
+                        writeln!(file, "\t.double {}", cursor.read_le::<f64>()?)?;
+                    }
+                    DataRefType::Code => {
+                        writeln!(file, "\t.quad {}", self.get_symbol(cursor.read_le::<u64>()?)?)?;
+                    }
+                    DataRefType::Unknown => {
+                        writeln!(file, "\t.quad 0x{:016X}", cursor.read_le::<u64>()?)?;
+                    }
+                    _ => {
+                        bail!("Unsupported data reference type {:?}", data_type);
+                    }
+                }
+            } else {
+                writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?;
+            }
         }
 
         if let Some(pb) = pb {
