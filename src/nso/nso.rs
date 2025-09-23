@@ -381,7 +381,8 @@ impl NSO {
                 .with_style(ProgressStyle::with_template("{prefix} {wide_bar} {binary_bytes}/{binary_total_bytes}  ").unwrap())
         );
 
-        for i in 0..bss_size {
+        // TODO: figure out where +8 comes from
+        for i in 0..(bss_size+8) {
             pb.as_ref().map(|p| p.inc(1));
 
             let bss_entry_offset = self.file.text.module.bss_start as u64 + i;
