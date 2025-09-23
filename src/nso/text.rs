@@ -399,7 +399,9 @@ impl TextSegment {
         while let Some(instr) = iter.next() {
             pb.as_ref().map(|p| p.inc(4));
             if reference_tracker.get_references_to(instr.address()).is_some() {
-                // TODO potentially mark as `.global {sym}`
+                // TODO not always mark as `.global {sym}` (for local branches)
+                writeln!(file, "# 0x{:X}:", instr.address())?;
+                writeln!(file, ".global {}", parent.get_symbol(instr.address(), helper)?)?;
                 writeln!(file, "{}:", parent.get_symbol(instr.address(), helper)?)?;
             }
 
