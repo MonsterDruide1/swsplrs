@@ -168,7 +168,6 @@ impl NSO {
         Ok(format!("{}_{:X}", prefix, address))
     }
 
-
     fn parse_buildstr(data: &mut Cursor<&Vec<u8>>) -> Result<String> {
         let zeros: [u8; 4] = data.read_le()?;
         ensure!(zeros == [0u8; 4], ".buildstr does not start with 4 null bytes");
@@ -406,14 +405,14 @@ impl NSO {
     fn export_rodata(&self, path: impl AsRef<Path>, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         self.export_data_section(path,
             ".rodata",
-            &self.file.rodata_segment,
-            self.file.header.embed_offset as u64 - self.file.header.dynstr_size as u64,
-            self.file.header.get_segment_mem_offset(&NsoSegment::Rodata) as u64 + self.file.header.dynstr_size as u64,
+            &self.file.rodata_segment[(self.file.header.dynstr_offset + self.file.header.dynstr_size) as usize ..],
+            self.file.header.embed_offset as u64 + self.file.header.embed_size as u64 - self.file.header.dynstr_size as u64 - self.file.header.dynstr_offset as u64,
+            self.file.header.get_segment_mem_offset(&NsoSegment::Rodata) as u64 + self.file.header.dynstr_offset as u64 + self.file.header.dynstr_size as u64,
             reference_tracker, helper, m
         )
     }
 
-    fn export_data_section(&self, path: impl AsRef<Path>, name: &str, data: &Vec<u8>, size: u64, offset: u64, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
+    fn export_data_section(&self, path: impl AsRef<Path>, name: &str, data: &[u8], size: u64, offset: u64, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
         writeln!(file, ".section \"{}\"", name)?;
