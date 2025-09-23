@@ -510,13 +510,19 @@ impl NSO {
         writeln!(file, ".section \".external.stubs\"")?;
         writeln!(file, "")?;
 
-        for i in 0..self.global_plt.len() {
-            let entry = &self.reloc_plt_table[i];
-            let sym = &self.symbol_table[entry.sym_idx as usize];
-            let name = &self.dynstr_table[&(sym.str_table_offset as u64)];
+        for sym in self.symbol_table.iter() {
+            if sym.value != 0 {
+                continue;  // only interested in undefined symbols
+            }
+            let name = self.dynstr_table.get(&(sym.str_table_offset as u64)).ok_or_else(|| anyhow::anyhow!("Undefined symbol in .dynsym has no name"))?;
+            if name == "" {
+                continue;  // skip empty names
+            }
             writeln!(file, ".global {}", name)?;
             writeln!(file, "{}:", name)?;
+            writeln!(file, "\tbrk #0")?;
             writeln!(file, "\tret")?;
+            writeln!(file, "")?;
         }
 
         Ok(())
