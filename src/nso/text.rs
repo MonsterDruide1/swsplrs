@@ -384,7 +384,11 @@ impl TextSegment {
             };
             if mnemonic == ".byte" {
                 if instr.bytes() == [0xFE, 0xDE, 0xFF, 0xE7] {
-                    writeln!(file, "\ttrap")?;
+                    //writeln!(file, "\ttrap")?;
+                    writeln!(file, "\t// TRAP instruction")?;
+                    for b in instr.bytes() {
+                        writeln!(file, "\t.byte 0x{:02X}", b)?;
+                    }
                 } else {
                     for b in instr.bytes() {
                         writeln!(file, "\t.byte 0x{:02X}", b)?;
@@ -428,7 +432,7 @@ impl TextSegment {
                             writeln!(file, "\t{} {}, {}, #{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, get_operand_imm(&detail, 2)?)?;
                         }
                     } else {
-                        writeln!(file, "\t{} {}, {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, get_operand_reg_name(&detail, 2, &cs)?)?;
+                        writeln!(file, "\t{} {}", mnemonic, instr.op_str().ok_or_else(|| anyhow::anyhow!("Failed to get operand string"))?)?;
                     }
                 }
                 "ldr" | "str" | "ldrh" | "strh" | "ldrb" | "strb" | "ldrsh" => {
