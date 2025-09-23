@@ -199,6 +199,8 @@ impl TextSegment {
                     bail!("No block associated with current address: 0x{:X}", instr.address());
                 };
 
+                let mut new_adrp_target = None;
+
                 match mnemonic {
                     // branching/jumps/calls
                     "blr" | "bl" => {
@@ -215,11 +217,11 @@ impl TextSegment {
                     // loads/stores
                     "adr" => {bail!("Unhandled adr instruction at 0x{:X}", instr.address());}
                     "adrp" => {
-                        current_block.adrp_targets_at_end.insert(get_operand_reg(&detail, 0)?, AdrpInfo {
+                        new_adrp_target = Some((get_operand_reg(&detail, 0)?, AdrpInfo {
                             target: get_operand_imm(&detail, 1)?,
                             location: instr.address(),
                             has_been_used: false,
-                        });
+                        }));
                         //println!("Found ADRP at 0x{:X} targeting 0x{:X} in register {:?}", instr.address(), get_operand_imm(&detail, 1)?, get_operand_reg(&detail, 0)?);
                         //println!("  Current block state: {:?}", current_block);
                     }
@@ -234,13 +236,13 @@ impl TextSegment {
                                 DataRefType::Unknown,
                                 &mut reference_tracker
                             )?;
-                            // for something like `add x23, x23, #20` and `x23` being an adrp target, adjust target of adrp
-                            if let Some(current_target) = current_block.adrp_targets_at_end.get(&get_operand_reg(&detail, 0)?) {
-                                current_block.adrp_targets_at_end.insert(get_operand_reg(&detail, 0)?, AdrpInfo {
+                            // for something like `add x22, x23, #20` and `x23` being an adrp target, adjust target of adrp
+                            if let Some(current_target) = current_block.adrp_targets_at_end.get(&get_operand_reg(&detail, 1)?) {
+                                new_adrp_target = Some((get_operand_reg(&detail, 0)?, AdrpInfo {
                                     target: current_target.target + offset,
                                     location: current_target.location,
                                     has_been_used: true,  // maybe it also just wants to get the pointer, in which case this target will not be used anymore
-                                });
+                                }));
                             }
                         }
                     }
@@ -282,11 +284,11 @@ impl TextSegment {
                         None  // ignore all other registers
                     }
                 }).collect();
-                // after handling instruction, mark all written registers as destroyed
+                // after handling instruction, mark all written registers as destroyed and add new ones
                 current_block.destroyed_regs.extend(destroyed_regs.iter());
-                if mnemonic != "adrp" && mnemonic != "add" {
-                    // result register of adrp/add is destroyed, but new entry should be retained
-                    current_block.adrp_targets_at_end.retain(|reg, _| !destroyed_regs.contains(reg));
+                current_block.adrp_targets_at_end.retain(|reg, _| !destroyed_regs.contains(reg));
+                if let Some((reg, target)) = new_adrp_target {
+                    current_block.adrp_targets_at_end.insert(reg, target);
                 }
             }
 
