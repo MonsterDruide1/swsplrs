@@ -348,13 +348,7 @@ impl NSO {
                     writeln!(file, "\t.quad {}", name)?;
                 }
                 RelocationType::R_AARCH64_RELATIVE => {
-                    let name = if let Some(sym_idx) = helper.symbol_table_value_to_idx.get(&(entry.addend as u64)) {
-                        let sym = &self.symbol_table[*sym_idx];
-                        &self.dynstr_table[&(sym.str_table_offset as u64)]
-                    } else {
-                        &format!("off_{:X}", entry.addend)
-                    };
-                    writeln!(file, "\t.quad {}", name)?;
+                    writeln!(file, "\t.quad {}", self.get_symbol(entry.addend as u64, helper)?)?;
                 }
                 _ => bail!("Unsupported relocation type {:?} in .got", entry.reloc_type),
             }
