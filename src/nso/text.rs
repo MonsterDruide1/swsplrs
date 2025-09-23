@@ -23,7 +23,8 @@ impl TextSegment {
         Self { module, section, section_offset }
     }
 
-    pub fn collect_references(&self, mut reference_tracker: &mut ReferenceTracker, mpb: &Option<MultiProgress>) -> anyhow::Result<()> {
+    // TODO: automatically analyze function boundaries to avoid `function_starts` and allow symbol-less binaries
+    pub fn collect_references(&self, function_starts: &HashSet<u64>, mut reference_tracker: &mut ReferenceTracker, mpb: &Option<MultiProgress>) -> anyhow::Result<()> {
         let cs = construct_capstone()?;
 
         #[derive(Debug, Clone)]
@@ -313,7 +314,7 @@ impl TextSegment {
 
         // global analysis: propagate `ADRP` targets through blocks, resolve potential references
         {
-            fn propagate_recursive(start: u64, reg: capstone::RegId, adrp: &AdrpInfo, blocks_map: &RangeMap<u64, BasicBlock>, reference_tracker: &mut ReferenceTracker, visited_blocks: &mut HashSet<u64>) -> Result<bool> {
+            fn propagate_recursive(start: u64, reg: capstone::RegId, adrp: &AdrpInfo, blocks_map: &RangeMap<u64, BasicBlock>, reference_tracker: &mut ReferenceTracker, visited_blocks: &mut HashSet<u64>, function_starts: &HashSet<u64>) -> Result<bool> {
                 if !visited_blocks.insert(start) {
                     return Ok(false);  // already visited
                 }
@@ -327,15 +328,19 @@ impl TextSegment {
                         } else {
                             SourceConflictResolution::Error
                         };
+                        //println!("Resolved reference at 0x{:X} using ADRP at 0x{:X}", pref.source_offset, adrp.location);
                         reference_tracker.add_reference(((adrp.target as i64) + pref.offset) as u64, ReferenceSource::Instruction(pref.source_offset), pref.ref_type, source_conflict_resolution)?;
                         reference_tracker.add_reference(((adrp.target as i64) + pref.offset) as u64, ReferenceSource::Instruction(adrp.location), pref.ref_type, SourceConflictResolution::KeepFirst)?;
-                        //println!("Resolved reference at 0x{:X} using ADRP at 0x{:X}", pref.source_offset, adrp.location);
                         found = true;
                     }
                 }
                 if !block.destroyed_regs.contains(&reg) {
                     for next in block.next_blocks.iter() {
-                        found |= propagate_recursive(*next, reg, adrp, blocks_map, reference_tracker, visited_blocks)?;
+                        if function_starts.contains(next) {
+                            // do not propagate across function boundaries
+                            continue;
+                        }
+                        found |= propagate_recursive(*next, reg, adrp, blocks_map, reference_tracker, visited_blocks, function_starts)?;
                     }
                 }
                 Ok(found)
@@ -354,8 +359,12 @@ impl TextSegment {
                 for (reg, adrp) in block.adrp_targets_at_end.iter() {
                     let mut found = adrp.has_been_used;
                     for next in block.next_blocks.iter() {
+                        if function_starts.contains(next) {
+                            // do not propagate across function boundaries
+                            continue;
+                        }
                         //println!("Propagating adrp from 0x{:X} to 0x{:X}", range.start, next);
-                        found |= propagate_recursive(*next, *reg, adrp, &blocks, &mut reference_tracker, &mut visited_blocks)?;
+                        found |= propagate_recursive(*next, *reg, adrp, &blocks, &mut reference_tracker, &mut visited_blocks, function_starts)?;
                     }
                     ensure!(found, "ADRP target at 0x{:X} in register {:?} in block 0x{:X}-0x{:X} could not be propagated to any reference", adrp.target, reg, range.start, range.end);
                     visited_blocks.clear();

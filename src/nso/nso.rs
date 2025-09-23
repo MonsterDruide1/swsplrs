@@ -107,11 +107,15 @@ impl NSO {
             Ok(())
         }
 
+        let function_symbols: HashSet<u64> = self.symbol_table.iter()
+            .filter(|s| s.get_type().ok() == Some(DynamicSymbolType::STT_FUNC) && s.value != 0)
+            .map(|s| s.value)
+            .collect();
         // TODO: collect references from data and rodata?
         let collect_references: Vec<(&str, Box<dyn FnMut(&mut ReferenceTracker, &Option<MultiProgress>) -> anyhow::Result<()>>)> = vec![
             (".rela.dyn", Box::new(|r,_| self.ref_types_relocations(r))),
             (".dynsym", Box::new(|r,_| self.ref_types_symbols(r))),
-            (".text", Box::new(|r,m| self.file.text.collect_references(r, &m))),
+            (".text", Box::new(|r,m| self.file.text.collect_references(&function_symbols, r, &m))),
         ];
         let total_collect_references = collect_references.len();
 
