@@ -130,6 +130,7 @@ impl NSO {
         let export_sections: Vec<(&str, Box<dyn FnMut(&mut ReferenceTracker, &Option<MultiProgress>) -> anyhow::Result<()>>)> = vec![
             (".got.plt", Box::new(|_,_| self.export_got_plt(path.join("got.plt.s")))),
             (".got", Box::new(|_,_| self.export_got(path.join("got.s"), &helper))),
+            ("external stubs", Box::new(|_,_| self.export_external_stubs(path.join("external.s")))),  // FIXME remove this once all other linker errors are gone and -r/-shared can be used
             (".text", Box::new(|r,m| self.file.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
             (".bss", Box::new(|r,m| self.export_bss(path.join("bss.s"), r, &helper, m))),
             (".data", Box::new(|r,m| self.export_data(path.join("data.s"), r, &helper, m))),
@@ -511,6 +512,25 @@ impl NSO {
 
         Ok(())
     }
+
+    fn export_external_stubs(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \".external.stubs\"")?;
+        writeln!(file, "")?;
+
+        for i in 0..self.global_plt.len() {
+            let entry = &self.reloc_plt_table[i];
+            let sym = &self.symbol_table[entry.sym_idx as usize];
+            let name = &self.dynstr_table[&(sym.str_table_offset as u64)];
+            writeln!(file, ".global {}", name)?;
+            writeln!(file, "{}:", name)?;
+            writeln!(file, "\tret")?;
+        }
+
+        Ok(())
+    }
+
 }
 
 #[binread]
