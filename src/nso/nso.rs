@@ -468,7 +468,7 @@ impl NSO {
                         writeln!(file, "\t.quad {}", self.get_symbol(cursor.read_le::<u64>()?, helper)?)?;
                     }
                     DataRefType::Unknown => {
-                        writeln!(file, "\t.quad 0x{:016X}", cursor.read_le::<u64>()?)?;
+                        writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?;
                     }
                     _ => {
                         bail!("Unsupported data reference type {:?}", data_type);
