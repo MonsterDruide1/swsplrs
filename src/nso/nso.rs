@@ -15,7 +15,7 @@ pub struct NSO {
     pub reloc_dyn_table: Vec<Relocation>,
     pub reloc_plt_table: Vec<Relocation>,
     pub dynstr_table: HashMap<u64, String>,
-    pub global_plt: Vec<u64>,
+    pub got_plt_metadata: GotMetadata,
     pub got_metadata: GotMetadata,
 }
 
@@ -54,13 +54,15 @@ impl NSO {
         let dynstr_table = Self::parse_dynamic_string_table(&file.rodata_segment, file.header.dynstr_offset, file.header.dynstr_size)?;
         
         // .got.plt
-        let global_plt = Self::parse_global_plt(
-            &file.data_segment[dynamic_offset + dynamic_segment.len()*0x18 .. ],
-            reloc_plt_table.iter().filter(|r| r.reloc_type == RelocationType::R_AARCH64_JUMP_SLOT).count()
-        )?;
+        let got_plt_metadata = GotMetadata {
+            start_offset: Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_PLTGOT)? as u64,
+            count: reloc_plt_table.iter().filter(|r| r.reloc_type == RelocationType::R_AARCH64_JUMP_SLOT).count() as u64,
+        };
+        // actually +0x18, but we handle that in export
+        // TODO: cleanup
 
         // .got
-        let got_start_offset = dynamic_offset as u64 + dynamic_segment.len() as u64*0x10+0x10 + 0x18+global_plt.len() as u64*8 + file.header.get_segment_mem_offset(&NsoSegment::Data) as u64;
+        let got_start_offset = got_plt_metadata.start_offset + got_plt_metadata.count*0x8+0x18;  // 0x18 for three 0 entries at the start
         let got_metadata = GotMetadata {
             start_offset: got_start_offset,
             count: (Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_INIT_ARRAY)? - got_start_offset) / 8,
@@ -74,7 +76,7 @@ impl NSO {
             reloc_dyn_table,
             reloc_plt_table,
             dynstr_table,
-            global_plt,
+            got_plt_metadata,
             got_metadata,
         })
     }
@@ -245,17 +247,6 @@ impl NSO {
         Ok(strings)
     }
 
-    fn parse_global_plt(data: &[u8], num_entries: usize) -> anyhow::Result<Vec<u64>> {
-        let data_without_header = &data[0x18..];
-        let mut plt_entries = Vec::with_capacity(num_entries);
-        let mut cursor = Cursor::new(data_without_header);
-        for _ in 0..num_entries {
-            let entry = u64::read_le(&mut cursor)?;
-            plt_entries.push(entry);
-        }
-        Ok(plt_entries)
-    }
-
     fn ref_types_relocations(&self, reference_tracker: &mut ReferenceTracker) -> anyhow::Result<()> {
         for relocation in self.reloc_dyn_table.iter() {
             match relocation.reloc_type {
@@ -319,8 +310,8 @@ impl NSO {
             got_plt_mem_offset += 8;
         }
 
-        for i in 0..self.global_plt.len() {
-            let entry = &self.reloc_plt_table[i];
+        for i in 0..self.got_plt_metadata.count {
+            let entry = &self.reloc_plt_table[i as usize];
             let sym = &self.symbol_table[entry.sym_idx as usize];
             let name = &self.dynstr_table[&(sym.str_table_offset as u64)];
             writeln!(file, ".global off_{:X}", got_plt_mem_offset)?;
