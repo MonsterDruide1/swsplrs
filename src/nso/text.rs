@@ -200,12 +200,27 @@ impl TextSegment {
                 };
 
                 let mut new_adrp_target = None;
+                // collect destroyed X-registers: either a direct write, or a write to the W-version of the register
+                let mut new_destroyed_regs: Vec<RegId> = detail.regs_write().iter().filter_map(|r| {
+                    // X29 and X30 are FP and LR, which have a lower value than X0-X28
+                    if r.0 >= Arm64Reg::ARM64_REG_X0 as u16 && r.0 <= Arm64Reg::ARM64_REG_X28 as u16 {
+                        Some(*r)
+                    } else if r.0 == Arm64Reg::ARM64_REG_X29 as u16 || r.0 == Arm64Reg::ARM64_REG_X30 as u16 {
+                        Some(*r)
+                    } else if r.0 >= Arm64Reg::ARM64_REG_W0 as u16 && r.0 <= Arm64Reg::ARM64_REG_W28 as u16 {
+                        Some(RegId(r.0 - (Arm64Reg::ARM64_REG_W0 as u16) + (Arm64Reg::ARM64_REG_X0 as u16)))  // map Wn to Xn
+                    } else if r.0 == Arm64Reg::ARM64_REG_W29 as u16 || r.0 == Arm64Reg::ARM64_REG_W30 as u16 {
+                        Some(RegId(r.0 - (Arm64Reg::ARM64_REG_W29 as u16) + (Arm64Reg::ARM64_REG_X29 as u16)))  // map W29/W30 to X29/X30
+                    } else {
+                        None  // ignore all other registers
+                    }
+                }).collect();
 
                 match mnemonic {
                     // branching/jumps/calls
                     "blr" | "bl" => {
                         // x0-x17 are scratch registers => destroyed by function call
-                        current_block.destroyed_regs.extend((Arm64Reg::ARM64_REG_X0..=Arm64Reg::ARM64_REG_X17).map(|r| RegId(r as u16)));
+                        new_destroyed_regs.extend((Arm64Reg::ARM64_REG_X0..=Arm64Reg::ARM64_REG_X17).map(|r| RegId(r as u16)));
                     }
                     "br" | "b" | "tbz" | "tbnz" | "cbz" | "cbnz" | "ret" => {
                         ensure!(instr.address() + 4 == range.end, "Block end does not match instruction end: branch at 0x{:X}, block spans 0x{:X}-0x{:X}", instr.address(), range.start, range.end);
@@ -282,24 +297,9 @@ impl TextSegment {
                     }
                 }
 
-                // collect destroyed X-registers: either a direct write, or a write to the W-version of the register
-                let destroyed_regs: Vec<RegId> = detail.regs_write().iter().filter_map(|r| {
-                    // X29 and X30 are FP and LR, which have a lower value than X0-X28
-                    if r.0 >= Arm64Reg::ARM64_REG_X0 as u16 && r.0 <= Arm64Reg::ARM64_REG_X28 as u16 {
-                        Some(*r)
-                    } else if r.0 == Arm64Reg::ARM64_REG_X29 as u16 || r.0 == Arm64Reg::ARM64_REG_X30 as u16 {
-                        Some(*r)
-                    } else if r.0 >= Arm64Reg::ARM64_REG_W0 as u16 && r.0 <= Arm64Reg::ARM64_REG_W28 as u16 {
-                        Some(RegId(r.0 - (Arm64Reg::ARM64_REG_W0 as u16) + (Arm64Reg::ARM64_REG_X0 as u16)))  // map Wn to Xn
-                    } else if r.0 == Arm64Reg::ARM64_REG_W29 as u16 || r.0 == Arm64Reg::ARM64_REG_W30 as u16 {
-                        Some(RegId(r.0 - (Arm64Reg::ARM64_REG_W29 as u16) + (Arm64Reg::ARM64_REG_X29 as u16)))  // map W29/W30 to X29/X30
-                    } else {
-                        None  // ignore all other registers
-                    }
-                }).collect();
                 // after handling instruction, mark all written registers as destroyed and add new ones
-                current_block.destroyed_regs.extend(destroyed_regs.iter());
-                current_block.adrp_targets_at_end.retain(|reg, _| !destroyed_regs.contains(reg));
+                current_block.destroyed_regs.extend(new_destroyed_regs.iter());
+                current_block.adrp_targets_at_end.retain(|reg, _| !new_destroyed_regs.contains(reg));
                 if let Some((reg, target)) = new_adrp_target {
                     current_block.adrp_targets_at_end.insert(reg, target);
                 }
