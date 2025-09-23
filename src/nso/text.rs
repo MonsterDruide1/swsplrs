@@ -231,7 +231,7 @@ impl TextSegment {
                                 get_operand_reg(&detail, 1)?,
                                 offset as i64,
                                 instr.address(),
-                                get_reg_type(get_operand_reg(&detail, 0)?, &cs)?,
+                                DataRefType::Unknown,
                                 &mut reference_tracker
                             )?;
                             // for something like `add x23, x23, #20` and `x23` being an adrp target, adjust target of adrp
