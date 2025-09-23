@@ -247,10 +247,17 @@ impl TextSegment {
                         }
                     }
                     "ldr" | "str" | "ldrh" | "strh" | "ldrb" | "strb" | "ldrsh" => {
+                        let target_reg_type = get_reg_type(get_operand_reg(&detail, 0)?, &cs)?;
                         let target_type = match mnemonic {
-                            "ldr" | "str" => DataRefType::Int64,  // might also load 32 bit only, or load float data without interpreting as float
-                            "ldrh" | "strh" | "ldrsh" => DataRefType::Int16,
-                            "ldrb" | "strb" => DataRefType::Int8,
+                            "ldr" | "str" => target_reg_type,
+                            "ldrh" | "strh" | "ldrsh" => {
+                                ensure!(target_reg_type == DataRefType::Int32 || target_reg_type == DataRefType::Int64, "Unexpected register type for {}: {:?}", mnemonic, target_reg_type);
+                                DataRefType::Int16
+                            }
+                            "ldrb" | "strb" => {
+                                ensure!(target_reg_type == DataRefType::Int32 || target_reg_type == DataRefType::Int64, "Unexpected register type for {}: {:?}", mnemonic, target_reg_type);
+                                DataRefType::Int8
+                            }
                             _ => bail!("Unhandled ldr/str instruction mnemonic at 0x{:X}: {}", instr.address(), mnemonic),
                         };
                         handle_potential_ref(
