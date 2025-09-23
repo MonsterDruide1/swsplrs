@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs::{self, File}, io::Cursor, path::Path, time::Duration};
+use std::{collections::{HashMap, HashSet}, fs::{self, File}, io::Cursor, path::Path, time::Duration};
 
 use anyhow::{bail, ensure, Result};
 use binrw::{binread, BinRead, BinReaderExt, NullString};
@@ -438,10 +438,11 @@ impl NSO {
         let mut cursor = Cursor::new(data);
         while cursor.position() < size {
             pb.as_ref().map(|p| p.set_position(cursor.position()));
+            let cursor_pos = cursor.position();
             
             // TODO: if outgoing reference, format as .quad
             let data_entry_offset = offset + cursor.position();
-            if let Some((data_type, _)) = reference_tracker.get_references_to(data_entry_offset) {
+            if let Some((data_type, sources)) = reference_tracker.get_references_to(data_entry_offset) {
                 let symbol = self.get_symbol(data_entry_offset, helper)?;
                 writeln!(file, ".global {}", symbol)?;
                 writeln!(file, "{}:", symbol)?;
@@ -479,6 +480,19 @@ impl NSO {
                     }
                     _ => {
                         bail!("Unsupported data reference type {:?}", data_type);
+                    }
+                }
+
+                // ensure that we didn't skip any references
+                if (cursor_pos+1) < cursor.position() {
+                    for skipped_off in (cursor_pos+1)..cursor.position() {
+                        let skipped_data_entry_offset = offset + skipped_off;
+                        if let Some((skipped_data_type, skipped_sources)) = reference_tracker.get_references_to(skipped_data_entry_offset) {
+                            bail!(
+                                "Missed reference to {:X} of type {:?} in {}, referenced by {:?}.\nEntry before: {:X} of type {:?}, referenced by {:?}",
+                                skipped_data_entry_offset, skipped_data_type, name, skipped_sources, data_entry_offset, data_type, sources
+                            );
+                        }
                     }
                 }
             } else {
@@ -683,7 +697,7 @@ pub enum ReferenceSource {
 }
 
 pub struct ReferenceTracker {
-    pub references_by_target: HashMap<u64, (DataRefType, Vec<ReferenceSource>)>,  // target -> (type, sources)
+    pub references_by_target: HashMap<u64, (DataRefType, HashSet<ReferenceSource>)>,  // target -> (type, sources)
     pub references_by_source: HashMap<ReferenceSource, (u64, SourceConflictResolution)>,  // source -> (target, resolution)
 }
 impl ReferenceTracker {
@@ -700,9 +714,9 @@ impl ReferenceTracker {
             if data_type != *existing_type {
                 *existing_type = std::cmp::min(data_type, *existing_type);
             }
-            sources.push(source);
+            sources.insert(source);
         } else {
-            self.references_by_target.insert(target, (data_type, vec![source]));
+            self.references_by_target.insert(target, (data_type, HashSet::from([source])));
         }
         if let Some((old, old_resolution)) = self.references_by_source.get(&source) && *old != target {
             ensure!(*old_resolution == source_conflict_resolution, "Source conflict resolution for source {:?} changed from {:?} to {:?}", source, old_resolution, source_conflict_resolution);
@@ -724,7 +738,7 @@ impl ReferenceTracker {
         Ok(())
     }
 
-    pub fn get_references_to(&self, target: u64) -> Option<&(DataRefType, Vec<ReferenceSource>)> {
+    pub fn get_references_to(&self, target: u64) -> Option<&(DataRefType, HashSet<ReferenceSource>)> {
         self.references_by_target.get(&target)
     }
 
