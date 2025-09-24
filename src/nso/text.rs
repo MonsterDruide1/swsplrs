@@ -14,7 +14,7 @@ pub struct TextSegment {
     pub section_offset: usize,  // offset of section within text segment
 }
 impl TextSegment {
-    pub fn new(text: &Vec<u8>) -> Self {
+    pub fn new(text: &[u8]) -> Self {
         let module = Module::read_le(&mut Cursor::new(text)).unwrap();
         // TODO: potentially read all 0-bytes until *actual* start of section
         let section_offset = std::mem::size_of::<Module>();

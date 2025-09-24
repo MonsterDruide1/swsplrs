@@ -1,16 +1,14 @@
 use std::{fs::File, io::{Read, Seek}};
 
 use anyhow::{ensure, Result};
-use binrw::BinRead;
+use binrw::{BinRead};
 use sha2::{Digest, Sha256};
 
-use crate::nso::{nso_header::{NsoHeader, NsoSegment}, text::TextSegment};
+use crate::nso::{nso_header::{NsoHeader, NsoSegment}};
 
 pub struct NsoFile {
     pub header: NsoHeader,
-    pub text: TextSegment,
-    pub rodata_segment: Vec<u8>,
-    pub data_segment: Vec<u8>,
+    pub memory: Vec<u8>,
 }
 impl NsoFile {
     pub fn new(mut file: File) -> Result<Self> {
@@ -19,22 +17,30 @@ impl NsoFile {
         let text_segment = Self::read_segment(&NsoSegment::Text, &mut file, &header)?;
         let rodata_segment = Self::read_segment(&NsoSegment::Rodata, &mut file, &header)?;
         let data_segment = Self::read_segment(&NsoSegment::Data, &mut file, &header)?;
-
+        
         if file.stream_position()? != file.metadata()?.len() {
             println!("Warning: file cursor not at end after reading segments: at 0x{:X} of 0x{:X}",
                 file.stream_position()?, file.metadata()?.len());
         }
 
-        let text = TextSegment::new(&text_segment);
+        ensure!(header.get_segment_mem_offset(&NsoSegment::Text) < header.get_segment_mem_offset(&NsoSegment::Rodata)
+            && header.get_segment_mem_offset(&NsoSegment::Rodata) < header.get_segment_mem_offset(&NsoSegment::Data),
+            "Segments are not in the expected order");
+
+        let mut binary = vec![0; (header.get_segment_mem_offset(&NsoSegment::Data) + header.get_segment_mem_size(&NsoSegment::Data)) as usize];
+        binary[header.get_segment_mem_offset(&NsoSegment::Text) as usize .. (header.get_segment_mem_offset(&NsoSegment::Text) + header.get_segment_mem_size(&NsoSegment::Text)) as usize]
+            .copy_from_slice(&text_segment);
+        binary[header.get_segment_mem_offset(&NsoSegment::Rodata) as usize .. (header.get_segment_mem_offset(&NsoSegment::Rodata) + header.get_segment_mem_size(&NsoSegment::Rodata)) as usize]
+            .copy_from_slice(&rodata_segment);
+        binary[header.get_segment_mem_offset(&NsoSegment::Data) as usize .. (header.get_segment_mem_offset(&NsoSegment::Data) + header.get_segment_mem_size(&NsoSegment::Data)) as usize]
+            .copy_from_slice(&data_segment);
 
         Ok(Self {
             header,
-            text,
-            rodata_segment,
-            data_segment,
+            memory: binary,
         })
     }
-    
+
     fn read_segment(segment: &NsoSegment, file: &mut File, header: &NsoHeader) -> anyhow::Result<Vec<u8>> {
         if file.stream_position()? != header.get_segment_file_offset(segment) as u64 {
             println!("File cursor is at unexpected position when reading {:?} segment: expected 0x{:X}, got 0x{:X}",
@@ -61,4 +67,35 @@ impl NsoFile {
         let end = start + self.header.get_segment_mem_size(segment) as u64;
         address >= start && address < end
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionType {
+    Text,
+    Plt,
+    ModuleName,
+    Rodata,
+    Hash,
+    GnuHash,
+    Dynsym,
+    Dynstr,
+    RelDyn,
+    RelaDyn,
+    RelPlt,
+    RelaPlt,
+    GccExceptTable,
+    EhFrameHdr,
+    EhFrame,
+    NoteGnuBuildId,
+    Data,
+    DataRelaRo,
+    DataRelRo,
+    Got,
+    Dynamic,
+    PreinitArray,
+    InitArray,
+    FiniArray,
+    Tdata,
+    Tbss,
+    Bss,
 }

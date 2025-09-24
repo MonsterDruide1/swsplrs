@@ -5,10 +5,11 @@ use binrw::{binread, BinRead, BinReaderExt, NullString};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use num_enum::TryFromPrimitive;
 
-use crate::nso::{nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}};
+use crate::nso::{nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}, text::TextSegment};
 
 pub struct NSO {
     pub file: NsoFile,
+    pub text: TextSegment,
     pub build_str: String,
     pub symbol_table: Vec<DynamicSymbol>,
     pub dynamic_segment: Vec<(DynamicTagType, u64)>,
@@ -21,37 +22,45 @@ pub struct NSO {
 
 impl NSO {
     pub fn new(file: NsoFile) -> anyhow::Result<Self> {
-        let mut rodata = Cursor::new(&file.rodata_segment);
-        let mut data = Cursor::new(&file.data_segment);
+        let text_segment = &file.memory[(file.header.get_segment_mem_offset(&NsoSegment::Text) as usize) ..
+            (file.header.get_segment_mem_offset(&NsoSegment::Text) + file.header.get_segment_mem_size(&NsoSegment::Text)) as usize];
+        let rodata_segment = &file.memory[(file.header.get_segment_mem_offset(&NsoSegment::Rodata) as usize) ..
+            (file.header.get_segment_mem_offset(&NsoSegment::Rodata) + file.header.get_segment_mem_size(&NsoSegment::Rodata)) as usize];
+        let data_segment = &file.memory[(file.header.get_segment_mem_offset(&NsoSegment::Data) as usize) ..
+            (file.header.get_segment_mem_offset(&NsoSegment::Data) + file.header.get_segment_mem_size(&NsoSegment::Data)) as usize];
+
+        let text = TextSegment::new(text_segment);
+        let mut rodata = Cursor::new(rodata_segment);
+        let mut data = Cursor::new(data_segment);
 
         // .buildstr
         let build_str = Self::parse_buildstr(&mut rodata)?;
 
         // .dynsym
-        let symbol_table = Self::parse_dynamic_symbols(&file.rodata_segment, file.header.dynsym_offset, file.header.dynsym_size)?;
+        let symbol_table = Self::parse_dynamic_symbols(&rodata_segment, file.header.dynsym_offset, file.header.dynsym_size)?;
 
         // .dynamic
-        let dynamic_offset = (file.text.module.header_offset + file.text.module.dyn_offset - file.header.get_segment_mem_offset(&NsoSegment::Data)) as usize;
+        let dynamic_offset = (text.module.header_offset + text.module.dyn_offset - file.header.get_segment_mem_offset(&NsoSegment::Data)) as usize;
         let dynamic_segment = Self::parse_dynamic_section(
-            &file.data_segment[dynamic_offset..]
+            &data_segment[dynamic_offset..]
         )?;
 
         // skip .hash and .gnu_hash for now
 
         // .rela.dyn
         let reloc_dyn_table = Self::parse_reloc_table(
-            &file.rodata_segment, &dynamic_segment, DynamicTagType::DT_RELA,
+            &rodata_segment, &dynamic_segment, DynamicTagType::DT_RELA,
             DynamicTagType::DT_RELASZ, &file.header
         )?;
 
         // .rela.plt
         let reloc_plt_table = Self::parse_reloc_table(
-            &file.rodata_segment, &dynamic_segment, DynamicTagType::DT_JMPREL,
+            &rodata_segment, &dynamic_segment, DynamicTagType::DT_JMPREL,
             DynamicTagType::DT_PLTRELSZ, &file.header
         )?;
 
         // .dynstr
-        let dynstr_table = Self::parse_dynamic_string_table(&file.rodata_segment, file.header.dynstr_offset, file.header.dynstr_size)?;
+        let dynstr_table = Self::parse_dynamic_string_table(&rodata_segment, file.header.dynstr_offset, file.header.dynstr_size)?;
         
         // .got.plt
         let got_plt_metadata = GotMetadata {
@@ -70,6 +79,7 @@ impl NSO {
 
         Ok(NSO {
             file,
+            text,
             build_str,
             symbol_table,
             dynamic_segment,
@@ -117,7 +127,7 @@ impl NSO {
         let collect_references: Vec<(&str, Box<dyn FnMut(&mut ReferenceTracker, &Option<MultiProgress>) -> anyhow::Result<()>>)> = vec![
             (".rela.dyn", Box::new(|r,_| self.ref_types_relocations(r))),
             (".dynsym", Box::new(|r,_| self.ref_types_symbols(r))),
-            (".text", Box::new(|r,m| self.file.text.collect_references(&function_symbols, r, &m))),
+            (".text", Box::new(|r,m| self.text.collect_references(&function_symbols, r, &m))),
         ];
         let total_collect_references = collect_references.len();
 
@@ -133,7 +143,7 @@ impl NSO {
             (".got.plt", Box::new(|_,_| self.export_got_plt(path.join("got.plt.s")))),
             (".got", Box::new(|_,_| self.export_got(path.join("got.s"), &helper))),
             ("external stubs", Box::new(|_,_| self.export_external_stubs(path.join("external.s")))),  // FIXME remove this once all other linker errors are gone and -r/-shared can be used
-            (".text", Box::new(|r,m| self.file.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
+            (".text", Box::new(|r,m| self.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
             (".bss", Box::new(|r,m| self.export_bss(path.join("bss.s"), r, &helper, m))),
             (".data", Box::new(|r,m| self.export_data(path.join("data.s"), r, &helper, m))),
             (".rodata", Box::new(|r,m| self.export_rodata(path.join("rodata.s"), r, &helper, m))),
@@ -168,7 +178,7 @@ impl NSO {
         Ok(format!("{}_{:X}", prefix, address))
     }
 
-    fn parse_buildstr(data: &mut Cursor<&Vec<u8>>) -> Result<String> {
+    fn parse_buildstr(data: &mut Cursor<&[u8]>) -> Result<String> {
         let zeros: [u8; 4] = data.read_le()?;
         ensure!(zeros == [0u8; 4], ".buildstr does not start with 4 null bytes");
 
@@ -363,7 +373,7 @@ impl NSO {
         writeln!(file, ".section \".bss\"")?;
         writeln!(file, "")?;
 
-        let bss_size = (self.file.text.module.bss_end - self.file.text.module.bss_start) as u64;
+        let bss_size = (self.text.module.bss_end - self.text.module.bss_start) as u64;
         let pb = m.as_ref().map(|m|
             m.add(ProgressBar::new(bss_size))
                 .with_prefix("   [1/1] Exporting .bss:")
@@ -374,7 +384,7 @@ impl NSO {
         for i in 0..(bss_size+8) {
             pb.as_ref().map(|p| p.inc(1));
 
-            let bss_entry_offset = self.file.text.module.bss_start as u64 + i;
+            let bss_entry_offset = self.text.module.bss_start as u64 + i;
             if let Some(_) = reference_tracker.get_references_to(bss_entry_offset) {
                 let symbol = self.get_symbol(bss_entry_offset, helper)?;
                 writeln!(file, ".global {}", symbol)?;
@@ -395,8 +405,8 @@ impl NSO {
         self.export_data_section(
             path,
             ".data",
-            &self.file.data_segment,
-            self.file.text.module.dyn_offset as u64 - self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64,
+            &self.file.memory,
+            self.text.module.dyn_offset as u64 - self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64,
             self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64,
             reference_tracker, helper, m
         )
@@ -405,7 +415,7 @@ impl NSO {
     fn export_rodata(&self, path: impl AsRef<Path>, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         self.export_data_section(path,
             ".rodata",
-            &self.file.rodata_segment[(self.file.header.dynstr_offset + self.file.header.dynstr_size) as usize ..],
+            &self.file.memory,
             self.file.header.embed_offset as u64 + self.file.header.embed_size as u64 - self.file.header.dynstr_size as u64 - self.file.header.dynstr_offset as u64,
             self.file.header.get_segment_mem_offset(&NsoSegment::Rodata) as u64 + self.file.header.dynstr_offset as u64 + self.file.header.dynstr_size as u64,
             reference_tracker, helper, m
@@ -424,7 +434,7 @@ impl NSO {
                 .with_style(ProgressStyle::with_template("{prefix} {wide_bar} {binary_bytes}/{binary_total_bytes}  ").unwrap())
         );
 
-        let mut cursor = Cursor::new(data);
+        let mut cursor = Cursor::new(&data[offset as usize..(offset as usize + size as usize)]);
         while cursor.position() < size {
             pb.as_ref().map(|p| p.set_position(cursor.position()));
             let cursor_pos = cursor.position();
