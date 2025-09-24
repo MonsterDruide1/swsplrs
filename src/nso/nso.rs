@@ -404,8 +404,8 @@ impl NSO {
 
         let (offset, array) = &self.init_array;
         ensure!(reference_tracker.get_references_to(*offset).is_some(), "No references to .init_array found, but trying to export it");
-        writeln!(file, ".global {}", offset)?;
-        writeln!(file, "{}:", offset)?;
+        writeln!(file, ".global off_{:X}", offset)?;
+        writeln!(file, "off_{:X}:", offset)?;
 
         for (i, &func) in array.iter().enumerate() {
             ensure!(reference_tracker.get_references_to(offset + i as u64*8).is_none() || i == 0, "Unexpected reference to .init_array entry {} at {:X} found", i, func);
