@@ -69,6 +69,8 @@ impl NsoFile {
     }
 }
 
+// list/order from https://github.com/h1k421/GLoat/blob/master/libgloat/application.ld
+// with slight adjustments based on nxo64.py and swspl
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SectionType {
     Text,

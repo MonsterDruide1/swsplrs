@@ -18,6 +18,7 @@ pub struct NSO {
     pub dynstr_table: HashMap<u64, String>,
     pub got_plt_metadata: GotMetadata,
     pub got_metadata: GotMetadata,
+    pub init_array: (u64, Vec<u64>),  // offset + entries
 }
 
 impl NSO {
@@ -77,6 +78,14 @@ impl NSO {
             count: (Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_INIT_ARRAY)? - got_start_offset) / 8,
         };
 
+        // .init_array
+        let init_array_offset = Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_INIT_ARRAY)?;
+        let init_array = Self::parse_init_array(
+            &file.memory,
+            init_array_offset,
+            Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_INIT_ARRAYSZ)? / 8
+        )?;
+
         Ok(NSO {
             file,
             text,
@@ -88,6 +97,7 @@ impl NSO {
             dynstr_table,
             got_plt_metadata,
             got_metadata,
+            init_array: (init_array_offset, init_array),
         })
     }
 
@@ -127,6 +137,7 @@ impl NSO {
         let collect_references: Vec<(&str, Box<dyn FnMut(&mut ReferenceTracker, &Option<MultiProgress>) -> anyhow::Result<()>>)> = vec![
             (".rela.dyn", Box::new(|r,_| self.ref_types_relocations(r))),
             (".dynsym", Box::new(|r,_| self.ref_types_symbols(r))),
+            (".init_array", Box::new(|r,_| self.ref_types_init_array(r))),
             (".text", Box::new(|r,m| self.text.collect_references(&function_symbols, r, &m))),
         ];
         let total_collect_references = collect_references.len();
@@ -143,6 +154,7 @@ impl NSO {
             (".got.plt", Box::new(|_,_| self.export_got_plt(path.join("got.plt.s")))),
             (".got", Box::new(|_,_| self.export_got(path.join("got.s"), &helper))),
             ("external stubs", Box::new(|_,_| self.export_external_stubs(path.join("external.s")))),  // FIXME remove this once all other linker errors are gone and -r/-shared can be used
+            (".init_array", Box::new(|r,_| self.export_init_array(path.join("init_array.s"), r, &helper))),
             (".text", Box::new(|r,m| self.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
             (".bss", Box::new(|r,m| self.export_bss(path.join("bss.s"), r, &helper, m))),
             (".data", Box::new(|r,m| self.export_data(path.join("data.s"), r, &helper, m))),
@@ -256,6 +268,15 @@ impl NSO {
         Ok(strings)
     }
 
+    fn parse_init_array(memory: &[u8], init_array_offset: u64, count: u64) -> anyhow::Result<Vec<u64>> {
+        let mut init_array = Vec::with_capacity(count as usize);
+        let mut cursor = Cursor::new(&memory[init_array_offset as usize .. (init_array_offset + count * 8) as usize]);
+        for _ in 0..count {
+            init_array.push(u64::read_le(&mut cursor)?);
+        }
+        Ok(init_array)
+    }
+
     fn ref_types_relocations(&self, reference_tracker: &mut ReferenceTracker) -> anyhow::Result<()> {
         for relocation in self.reloc_dyn_table.iter() {
             match relocation.reloc_type {
@@ -300,6 +321,13 @@ impl NSO {
             }
         }
 
+        Ok(())
+    }
+
+    fn ref_types_init_array(&self, reference_tracker: &mut ReferenceTracker) -> anyhow::Result<()> {
+        for (i, &func) in self.init_array.1.iter().enumerate() {
+            reference_tracker.add_reference(func, ReferenceSource::InitArray(i as u64), DataRefType::Code, SourceConflictResolution::Error)?;
+        }
         Ok(())
     }
 
@@ -367,6 +395,26 @@ impl NSO {
         Ok(())
     }
 
+    fn export_init_array(&self, path: impl AsRef<Path>, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \".init_array\"")?;
+        writeln!(file, "")?;
+
+        let (offset, array) = &self.init_array;
+        ensure!(reference_tracker.get_references_to(*offset).is_some(), "No references to .init_array found, but trying to export it");
+        writeln!(file, ".global {}", offset)?;
+        writeln!(file, "{}:", offset)?;
+
+        for (i, &func) in array.iter().enumerate() {
+            ensure!(reference_tracker.get_references_to(offset + i as u64*8).is_none() || i == 0, "Unexpected reference to .init_array entry {} at {:X} found", i, func);
+            ensure!(helper.symbol_table_value_to_idx.get(&func).is_none(), "Unexpected symbol for .init_array entry {} at {:X} found", i, func);
+            writeln!(file, "\t.quad {}", self.get_symbol(func, helper)?)?;
+        }
+
+        Ok(())
+    }
+
     fn export_bss(&self, path: impl AsRef<Path>, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
@@ -422,7 +470,7 @@ impl NSO {
         )
     }
 
-    fn export_data_section(&self, path: impl AsRef<Path>, name: &str, data: &[u8], size: u64, offset: u64, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
+    fn export_data_section(&self, path: impl AsRef<Path>, name: &str, memory: &[u8], size: u64, offset: u64, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
         writeln!(file, ".section \"{}\"", name)?;
@@ -434,7 +482,7 @@ impl NSO {
                 .with_style(ProgressStyle::with_template("{prefix} {wide_bar} {binary_bytes}/{binary_total_bytes}  ").unwrap())
         );
 
-        let mut cursor = Cursor::new(&data[offset as usize..(offset as usize + size as usize)]);
+        let mut cursor = Cursor::new(&memory[offset as usize..(offset as usize + size as usize)]);
         while cursor.position() < size {
             pb.as_ref().map(|p| p.set_position(cursor.position()));
             let cursor_pos = cursor.position();
@@ -718,6 +766,7 @@ pub enum ReferenceSource {
     Instruction(u64),  // address of instruction
     Symbol,
     Relocation(u64),   // offset of relocation
+    InitArray(u64),    // index of init_array entry
 }
 
 pub struct ReferenceTracker {
