@@ -21,8 +21,8 @@ fn main() -> anyhow::Result<()> {
     println!("Reading NSO file...");
     let nso = NSO::new(NsoFile::new(File::open(&args.input)?)?)?;
 
-    println!("Exporting all segments to 'out' directory...");
-    nso.export_all(std::path::Path::new("out"), args.no_progress)?;
+    println!("Exporting all segments to 'out/asm' directory...");
+    nso.export_all(std::path::Path::new("out/asm"), args.no_progress)?;
     println!("Done.");
     Ok(())
 }
