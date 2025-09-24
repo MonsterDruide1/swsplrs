@@ -155,6 +155,7 @@ impl NSO {
             (".got", Box::new(|_,_| self.export_got(path.join("got.s"), &helper))),
             ("external stubs", Box::new(|_,_| self.export_external_stubs(path.join("external.s")))),  // FIXME remove this once all other linker errors are gone and -r/-shared can be used
             (".init_array", Box::new(|r,_| self.export_init_array(path.join("init_array.s"), r, &helper))),
+            (".some_tls", Box::new(|_,_| self.export_some_tls(path.join("some_tls.s")))),
             (".text", Box::new(|r,m| self.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
             (".bss", Box::new(|r,m| self.export_bss(path.join("bss.s"), r, &helper, m))),
             (".data", Box::new(|r,m| self.export_data(path.join("data.s"), r, &helper, m))),
@@ -579,6 +580,20 @@ impl NSO {
         Ok(())
     }
 
+    // FIXME: figure out how to properly generate this section
+    fn export_some_tls(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \".some_tls\"")?;
+        writeln!(file, "")?;
+
+        let offset = self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64 + self.file.header.get_segment_mem_size(&NsoSegment::Data) as u64;
+        writeln!(file, ".global off_{:X}", offset)?;
+        writeln!(file, "off_{:X}:", offset)?;
+        writeln!(file, "\t.quad 0")?;
+
+        Ok(())
+    }
 }
 
 #[binread]
