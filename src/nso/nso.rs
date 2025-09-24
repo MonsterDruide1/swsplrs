@@ -495,40 +495,19 @@ impl NSO {
                 writeln!(file, ".global {}", symbol)?;
                 writeln!(file, "{}:", symbol)?;
                 match data_type {
-                    DataRefType::Int8 => {
-                        writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?;
-                    }
-                    DataRefType::Int16 => {
-                        writeln!(file, "\t.short 0x{:04X}", cursor.read_le::<u16>()?)?;
-                    }
-                    DataRefType::Int32 => {
-                        writeln!(file, "\t.word 0x{:08X}", cursor.read_le::<u32>()?)?;
-                    }
-                    DataRefType::Int64 => {
-                        writeln!(file, "\t.quad 0x{:016X}", cursor.read_le::<u64>()?)?;
-                    }
-                    DataRefType::Float32 => {
-                        // TODO might require some special encoding/representation for assembler
-                        writeln!(file, "\t.float {}", cursor.read_le::<f32>()?)?;
-                    }
-                    DataRefType::Float64 => {
-                        // TODO might require some special encoding/representation for assembler
-                        writeln!(file, "\t.double {}", cursor.read_le::<f64>()?)?;
-                    }
+                    DataRefType::Int8 => writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?,
+                    DataRefType::Int16 => writeln!(file, "\t.short 0x{:04X}", cursor.read_le::<u16>()?)?,
+                    DataRefType::Int32 => writeln!(file, "\t.word 0x{:08X}", cursor.read_le::<u32>()?)?,
+                    DataRefType::Int64 => writeln!(file, "\t.quad 0x{:016X}", cursor.read_le::<u64>()?)?,
+                    DataRefType::Float32 => writeln!(file, "\t.float {}", cursor.read_le::<f32>()?)?,
+                    DataRefType::Float64 => writeln!(file, "\t.double {}", cursor.read_le::<f64>()?)?,
                     DataRefType::Float128 => {
                         for _ in 0..16 {
                             writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?;
                         }
                     }
-                    DataRefType::Code => {
-                        writeln!(file, "\t.quad {}", self.get_symbol(cursor.read_le::<u64>()?, helper)?)?;
-                    }
-                    DataRefType::Unknown => {
-                        writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?;
-                    }
-                    _ => {
-                        bail!("Unsupported data reference type {:?}", data_type);
-                    }
+                    DataRefType::Unknown => writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?,
+                    _ => bail!("Unsupported data reference type {:?}", data_type),
                 }
 
                 // ensure that we didn't skip any references
