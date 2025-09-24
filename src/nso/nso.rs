@@ -155,7 +155,7 @@ impl NSO {
             (".got", Box::new(|_,_| self.export_got(path.join("got.s"), &helper))),
             ("external stubs", Box::new(|_,_| self.export_external_stubs(path.join("external.s")))),  // FIXME remove this once all other linker errors are gone and -r/-shared can be used
             (".init_array", Box::new(|r,_| self.export_init_array(path.join("init_array.s"), r, &helper))),
-            (".some_tls", Box::new(|_,_| self.export_some_tls(path.join("some_tls.s")))),
+            ("section_start_labels", Box::new(|_,_| self.export_section_start_labels(path.join("section_start_labels.s")))),
             (".text", Box::new(|r,m| self.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
             (".bss", Box::new(|r,m| self.export_bss(path.join("bss.s"), r, &helper, m))),
             (".data", Box::new(|r,m| self.export_data(path.join("data.s"), r, &helper, m))),
@@ -580,16 +580,45 @@ impl NSO {
         Ok(())
     }
 
-    // FIXME: figure out how to properly generate this section
-    fn export_some_tls(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+    // FIXME: figure out how to properly generate these labels
+    fn export_section_start_labels(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        // names from https://github.com/shinyquagsire23/switch-oss/blob/171a7426a95def81c4abf038730130f9e13c6788/src/rocrt_nro.cpp#L116
         use std::io::Write;
         let mut file = File::create(path)?;
-        writeln!(file, ".section \".some_tls\"")?;
+        writeln!(file, ".section \".section_start_labels\"")?;
         writeln!(file, "")?;
 
-        let offset = self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64 + self.file.header.get_segment_mem_size(&NsoSegment::Data) as u64;
-        writeln!(file, ".global off_{:X}", offset)?;
-        writeln!(file, "off_{:X}:", offset)?;
+        //  tdata_start, tdata_end, tdata_align_rel,
+        //  tbss_start,  tbss_end,  tbss_align_rel
+        let tdata_tbss = self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64 + self.file.header.get_segment_mem_size(&NsoSegment::Data) as u64;
+        writeln!(file, ".global off_{:X}", tdata_tbss)?;
+        writeln!(file, "off_{:X}:", tdata_tbss)?;
+        writeln!(file, "\t.quad 0")?;
+
+        // rela_dyn_start
+        let rela_dyn_start = Self::get_dynamic_tag_value(&self.dynamic_segment, DynamicTagType::DT_RELA)?;
+        writeln!(file, ".global off_{:X}", rela_dyn_start)?;
+        writeln!(file, "off_{:X}:", rela_dyn_start)?;
+        writeln!(file, "\t.quad 0")?;
+
+        // rela_dyn_end / rela_plt_start
+        let rela_plt_start = Self::get_dynamic_tag_value(&self.dynamic_segment, DynamicTagType::DT_RELA)? +
+            Self::get_dynamic_tag_value(&self.dynamic_segment, DynamicTagType::DT_RELASZ)?;
+        writeln!(file, ".global off_{:X}", rela_plt_start)?;
+        writeln!(file, "off_{:X}:", rela_plt_start)?;
+        writeln!(file, "\t.quad 0")?;
+
+        // rela_plt_end
+        let rela_plt_end = Self::get_dynamic_tag_value(&self.dynamic_segment, DynamicTagType::DT_JMPREL)? +
+            Self::get_dynamic_tag_value(&self.dynamic_segment, DynamicTagType::DT_PLTRELSZ)?;
+        writeln!(file, ".global off_{:X}", rela_plt_end)?;
+        writeln!(file, "off_{:X}:", rela_plt_end)?;
+        writeln!(file, "\t.quad 0")?;
+
+        // DYNAMIC
+        let dynamic = (self.text.module.header_offset + self.text.module.dyn_offset) as usize;
+        writeln!(file, ".global off_{:X}", dynamic)?;
+        writeln!(file, "off_{:X}:", dynamic)?;
         writeln!(file, "\t.quad 0")?;
 
         Ok(())
