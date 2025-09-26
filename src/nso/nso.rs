@@ -302,10 +302,10 @@ impl NSO {
             let sym_type = symbol.get_type()?;
             match sym_type {
                 DynamicSymbolType::STT_OBJECT => {
-                    reference_tracker.add_reference(symbol.value, ReferenceSource::Symbol, DataRefType::Unknown, SourceConflictResolution::KeepFirst)?;
+                    reference_tracker.add_reference(symbol.value, ReferenceSource::Symbol, DataRefType::Object(symbol.size), SourceConflictResolution::KeepFirst)?;
                 }
                 DynamicSymbolType::STT_FUNC => {
-                    reference_tracker.add_reference(symbol.value, ReferenceSource::Symbol, DataRefType::Code, SourceConflictResolution::KeepFirst)?;
+                    reference_tracker.add_reference(symbol.value, ReferenceSource::Symbol, DataRefType::Function(symbol.size), SourceConflictResolution::KeepFirst)?;
                 }
                 DynamicSymbolType::STT_NOTYPE => {
                     ensure!(name.is_some_and(|x| x == "end"),
@@ -506,24 +506,32 @@ impl NSO {
                             writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?;
                         }
                     }
+                    DataRefType::Object(size) => {
+                        if size % 8 == 0 {
+                            for _ in 0..(size / 8) {
+                                writeln!(file, "\t.quad 0x{:016X}", cursor.read_le::<u64>()?)?;
+                            }
+                        } else {
+                            for _ in 0..*size {
+                                writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?;
+                            }
+                        }
+                    }
                     DataRefType::Unknown => writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?,
                     _ => bail!("Unsupported data reference type {:?}", data_type),
                 }
-
-                // ensure that we didn't skip any references
-                if (cursor_pos+1) < cursor.position() {
-                    for skipped_off in (cursor_pos+1)..cursor.position() {
-                        let skipped_data_entry_offset = offset + skipped_off;
-                        if let Some((skipped_data_type, skipped_sources)) = reference_tracker.get_references_to(skipped_data_entry_offset) {
-                            bail!(
-                                "Missed reference to {:X} of type {:?} in {}, referenced by {:?}.\nEntry before: {:X} of type {:?}, referenced by {:?}",
-                                skipped_data_entry_offset, skipped_data_type, name, skipped_sources, data_entry_offset, data_type, sources
-                            );
-                        }
-                    }
-                }
             } else {
                 writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?;
+            }
+
+            // ensure that we didn't skip any references
+            if (cursor_pos+1) < cursor.position() {
+                for skipped_off in (cursor_pos+1)..cursor.position() {
+                    let skipped_data_entry_offset = offset + skipped_off;
+                    if let Some((skipped_data_type, skipped_sources)) = reference_tracker.get_references_to(skipped_data_entry_offset) {
+                        bail!("Missed reference to {:X} of type {:?} in {}, referenced by {:?}.", skipped_data_entry_offset, skipped_data_type, name, skipped_sources);
+                    }
+                }
             }
         }
 
@@ -766,6 +774,8 @@ impl NsoLookupHelper {
 // top = most specific. If conflicts are found, the lower value (more specific) is used.
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub enum DataRefType {
+    Object(u64),   // size in bytes
+    Function(u64), // size in bytes
     Code,
     Float8,
     Int8,
