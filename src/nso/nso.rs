@@ -13,8 +13,8 @@ pub struct NSO {
     pub build_str: String,
     pub symbol_table: (u64, Vec<DynamicSymbol>),
     pub dynamic_segment: Vec<(DynamicTagType, u64)>,
-    pub reloc_dyn_table: (u64, Vec<Relocation>),  // offset + entries
-    pub reloc_plt_table: (u64, Vec<Relocation>),  // offset + entries
+    pub reloc_dyn_table: Vec<Relocation>,
+    pub reloc_plt_table: Vec<Relocation>,
     pub dynstr_table: HashMap<u64, String>,
     pub got_plt_metadata: GotMetadata,
     pub got_metadata: GotMetadata,
@@ -66,7 +66,7 @@ impl NSO {
         // .got.plt
         let got_plt_metadata = GotMetadata {
             start_offset: Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_PLTGOT)? as u64,
-            count: reloc_plt_table.1.iter().filter(|r| r.reloc_type == RelocationType::R_AARCH64_JUMP_SLOT).count() as u64,
+            count: reloc_plt_table.iter().filter(|r| r.reloc_type == RelocationType::R_AARCH64_JUMP_SLOT).count() as u64,
         };
         // actually +0x18, but we handle that in export
         // TODO: cleanup
@@ -240,7 +240,7 @@ impl NSO {
     fn parse_reloc_table(
         rodata_segment: &[u8], dynamic_segment: &[(DynamicTagType, u64)],
         off_tag: DynamicTagType, size_tag: DynamicTagType, header: &NsoHeader
-    ) -> anyhow::Result<(u64, Vec<Relocation>)> {
+    ) -> anyhow::Result<Vec<Relocation>> {
         let offset = Self::get_dynamic_tag_value(dynamic_segment, off_tag)?;
         let rela_offset = (offset - header.get_segment_mem_offset(&NsoSegment::Rodata) as u64) as usize;
         let rela_size = Self::get_dynamic_tag_value(dynamic_segment, size_tag)? as usize;
@@ -256,7 +256,7 @@ impl NSO {
             let reloc = Relocation::read_le(&mut cursor)?;
             relocations.push(reloc);
         }
-        Ok((offset, relocations))
+        Ok(relocations)
     }
 
     fn parse_dynamic_string_table(rodata_segment: &[u8], dynstr_offset: u32, dynstr_size: u32) -> anyhow::Result<HashMap<u64, String>> {
@@ -279,9 +279,7 @@ impl NSO {
     }
 
     fn ref_types_relocations(&self, reference_tracker: &mut ReferenceTracker) -> anyhow::Result<()> {
-        let (offset, table) = &self.reloc_dyn_table;
-        for (i, relocation) in table.iter().enumerate() {
-            let offset = offset + i as u64 * std::mem::size_of::<Relocation>() as u64;
+        for relocation in self.reloc_dyn_table.iter() {
             match relocation.reloc_type {
                 RelocationType::R_AARCH64_GLOB_DAT | RelocationType::R_AARCH64_ABS64 => {
                     reference_tracker.add_reference(self.symbol_table.1[relocation.sym_idx as usize].value, ReferenceSource::Relocation, relocation.offset, DataRefType::Unknown);
@@ -355,7 +353,7 @@ impl NSO {
         }
 
         for i in 0..self.got_plt_metadata.count {
-            let entry = &self.reloc_plt_table.1[i as usize];
+            let entry = &self.reloc_plt_table[i as usize];
             let sym = &self.symbol_table.1[entry.sym_idx as usize];
             let name = &self.dynstr_table[&(sym.str_table_offset as u64)];
             writeln!(file, ".global off_{:X}", got_plt_mem_offset)?;
@@ -383,7 +381,7 @@ impl NSO {
                 writeln!(file, "")?;
                 continue;
             };
-            let entry = &self.reloc_dyn_table.1[*entry_index];
+            let entry = &self.reloc_dyn_table[*entry_index];
 
             match entry.reloc_type {
                 RelocationType::R_AARCH64_GLOB_DAT | RelocationType::R_AARCH64_ABS64 => {
@@ -767,8 +765,8 @@ pub struct NsoLookupHelper {
 }
 impl NsoLookupHelper {
     pub fn new(nso: &NSO) -> anyhow::Result<Self> {
-        let reloc_dyn_addr_to_idx = nso.reloc_dyn_table.1.iter().enumerate().map(|(i,r)| (r.offset, i)).collect::<HashMap<_, _>>();
-        ensure!(reloc_dyn_addr_to_idx.len() == nso.reloc_dyn_table.1.len(), "Duplicate entries in .rela.dyn");
+        let reloc_dyn_addr_to_idx = nso.reloc_dyn_table.iter().enumerate().map(|(i,r)| (r.offset, i)).collect::<HashMap<_, _>>();
+        ensure!(reloc_dyn_addr_to_idx.len() == nso.reloc_dyn_table.len(), "Duplicate entries in .rela.dyn");
 
         let symbol_table_value_to_idx = nso.symbol_table.1.iter().enumerate().map(|(i, sym)| (sym.value, i)).collect::<HashMap<_, _>>();
         if symbol_table_value_to_idx.len() != nso.symbol_table.1.len() {
