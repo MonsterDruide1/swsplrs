@@ -514,17 +514,8 @@ impl NSO {
                             writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?;
                         }
                     }
-                    DataRefType::Object(size) => {
-                        if size % 8 == 0 {
-                            for _ in 0..(size / 8) {
-                                writeln!(file, "\t.quad 0x{:016X}", cursor.read_le::<u64>()?)?;
-                            }
-                        } else {
-                            for _ in 0..size {
-                                writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?;
-                            }
-                        }
-                    }
+                    // TODO: there's more information in Object(size), but potentially references to data within the object
+                    DataRefType::Object(_) => writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?,
                     DataRefType::Unknown => writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?,
                     _ => bail!("Unsupported data reference type {:?}", data_type),
                 }
