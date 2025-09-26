@@ -136,6 +136,7 @@ impl NSO {
         let collect_references: Vec<(&str, Box<dyn FnMut(&mut ReferenceTracker, &Option<MultiProgress>) -> anyhow::Result<()>>)> = vec![
             (".rela.dyn", Box::new(|r,_| self.ref_types_relocations(r))),
             (".dynsym", Box::new(|r,_| self.ref_types_symbols(r))),
+            (".init_array", Box::new(|r,_| self.ref_types_init_array(r))),
             (".text", Box::new(|r,m| self.text.collect_references(&function_symbols, r, &m))),
         ];
         let total_collect_references = collect_references.len();

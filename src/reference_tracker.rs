@@ -70,6 +70,13 @@ impl ReferenceTracker {
                 references_by_target.insert(target, (target_type, HashSet::from([source_type])));
             }
             if let Some((old_src, old_target)) = references_by_source.get_mut(&source) {
+                if (*old_src == ReferenceSource::Relocation && source_type == ReferenceSource::InitArray) ||
+                   (*old_src == ReferenceSource::InitArray && source_type == ReferenceSource::Relocation) {
+                    // allow relocation and init_array to point to the same source, mark as InitArray
+                    ensure!(*old_target == target, "InitArray already points to a different target: old: 0x{:X}, new: 0x{:X} at 0x{:X}", *old_target, target, source);
+                    *old_src = ReferenceSource::InitArray;
+                    continue;
+                }
                 ensure!(*old_src == source_type, "Source types are not the same! Old: {:?}, New: {:?} at 0x{:X}", old_src, source_type, source);
                 if source_type == ReferenceSource::ADRP {
                     // adrp can point to multiple targets, but they must have the same higher bits
