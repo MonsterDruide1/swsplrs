@@ -6,7 +6,7 @@ use capstone::{self, arch::{arm64::{Arm64Operand, Arm64OperandType, Arm64Reg}, A
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rangemap::RangeMap;
 
-use crate::nso::nso::{DataRefType, NsoLookupHelper, ReferenceSource, ReferenceTracker, SourceConflictResolution, NSO};
+use crate::{nso::nso::{NsoLookupHelper, NSO}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}};
 
 pub struct TextSegment {
     pub module: Module,
@@ -31,14 +31,16 @@ impl TextSegment {
         struct PotentialRef {
             register: capstone::RegId,
             offset: i64,
+            source_type: ReferenceSource,
             source_offset: u64,  // address of instruction that generated this potential reference
             ref_type: DataRefType,
         }
         #[derive(Debug, Clone)]
         struct AdrpInfo {
             target: u64,
-            location: u64,  // address of the adrp instruction
-            has_been_used: bool,
+            location: u64,        // address of the adrp instruction
+            has_been_used: bool,  // has been used for *something* (add, ldr, str) => used to detect unused ADRPs
+            is_added: bool,       // has this adrp been combined with an add instruction yet? => used to remove ldr/str with conflicting targets
         }
         #[derive(Debug, Clone)]
         struct BasicBlock {
@@ -91,26 +93,26 @@ impl TextSegment {
                         finish_basic_block(instr.address(), vec![]);
                     }
                     "bl" => {
-                        reference_tracker.add_reference(get_operand_imm(&detail, 0)?, ReferenceSource::Instruction(instr.address()), DataRefType::Code, SourceConflictResolution::Error)?;
+                        reference_tracker.add_reference(get_operand_imm(&detail, 0)?, ReferenceSource::BL, instr.address(), DataRefType::Code);
                     }
                     "b" => {
                         let target = get_operand_imm(&detail, 0)?;
-                        reference_tracker.add_reference(target, ReferenceSource::Instruction(instr.address()), DataRefType::Code, SourceConflictResolution::Error)?;
+                        reference_tracker.add_reference(target, ReferenceSource::B_tail, instr.address(), DataRefType::Code);
                         finish_basic_block(instr.address(), vec![target]);
                     }
                     "tbz" | "tbnz" => {
                         let target = get_operand_imm(&detail, 2)?;
-                        reference_tracker.add_reference(target, ReferenceSource::Instruction(instr.address()), DataRefType::Code, SourceConflictResolution::Error)?;
+                        reference_tracker.add_reference(target, ReferenceSource::B_conditional, instr.address(), DataRefType::Code);
                         finish_basic_block(instr.address(), vec![target, instr.address()+4]);
                     }
                     "cbz" | "cbnz" => {
                         let target = get_operand_imm(&detail, 1)?;
-                        reference_tracker.add_reference(target, ReferenceSource::Instruction(instr.address()), DataRefType::Code, SourceConflictResolution::Error)?;
+                        reference_tracker.add_reference(target, ReferenceSource::B_conditional, instr.address(), DataRefType::Code);
                         finish_basic_block(instr.address(), vec![target, instr.address()+4]);
                     }
                     s if s.starts_with("b.") => {  // conditionals with b (b.eq, b.ne, b.lt, ...)
                         let target = get_operand_imm(&detail, 0)?;
-                        reference_tracker.add_reference(target, ReferenceSource::Instruction(instr.address()), DataRefType::Code, SourceConflictResolution::Error)?;
+                        reference_tracker.add_reference(target, ReferenceSource::B_conditional, instr.address(), DataRefType::Code);
                         finish_basic_block(instr.address(), vec![target, instr.address()+4]);
                     }
                     "ret" => {
@@ -156,20 +158,16 @@ impl TextSegment {
 
         // local analysis: analyze basic blocks
         {
-            let handle_potential_ref = |block: &mut BasicBlock, src_reg: RegId, offset: i64, source_offset: u64, ref_type: DataRefType, reference_tracker: &mut ReferenceTracker| -> Result<()> {
+            let handle_potential_ref = |block: &mut BasicBlock, src_reg: RegId, offset: i64, source_type: ReferenceSource, source_offset: u64, ref_type: DataRefType, reference_tracker: &mut ReferenceTracker| -> Result<()> {
                 if let Some(adrp) = block.adrp_targets_at_end.get_mut(&src_reg) {
-                    let source_conflict_resolution = if adrp.has_been_used {
-                        SourceConflictResolution::BlockSource  // no load expected, it's just pointer magic (example: strings)
-                    } else {
-                        SourceConflictResolution::Error
-                    };
-                    reference_tracker.add_reference(((adrp.target as i64) + offset) as u64, ReferenceSource::Instruction(source_offset), ref_type, source_conflict_resolution)?;
-                    reference_tracker.add_reference(((adrp.target as i64) + offset) as u64, ReferenceSource::Instruction(adrp.location), ref_type, SourceConflictResolution::KeepFirst)?;
+                    reference_tracker.add_reference(((adrp.target as i64) + offset) as u64, source_type, source_offset, ref_type);
+                    reference_tracker.add_reference(((adrp.target as i64) + offset) as u64, ReferenceSource::ADRP, adrp.location, ref_type);
                     adrp.has_been_used = true;  // mark as used within this block
                 } else if !block.destroyed_regs.contains(&src_reg) {
                     block.potential_refs.push(PotentialRef {
                         register: src_reg,
                         offset,
+                        source_type,
                         source_offset,
                         ref_type,
                     });
@@ -237,6 +235,7 @@ impl TextSegment {
                             target: get_operand_imm(&detail, 1)?,
                             location: instr.address(),
                             has_been_used: false,
+                            is_added: false,
                         }));
                         //println!("Found ADRP at 0x{:X} targeting 0x{:X} in register {:?}", instr.address(), get_operand_imm(&detail, 1)?, get_operand_reg(&detail, 0)?);
                         //println!("  Current block state: {:?}", current_block);
@@ -244,10 +243,12 @@ impl TextSegment {
                     "add" => {
                         // we are only interested in adds with last operand being an immediate (=> offset)
                         if let Ok(offset) = get_operand_imm(&detail, 2) {
+                            let src_reg = get_operand_reg(&detail, 1)?;
                             handle_potential_ref(
                                 current_block,
-                                get_operand_reg(&detail, 1)?,
+                                src_reg,
                                 offset as i64,
+                                ReferenceSource::ADD(current_block.adrp_targets_at_end.get(&src_reg).is_some_and(|x| x.has_been_used)),
                                 instr.address(),
                                 DataRefType::Unknown,
                                 &mut reference_tracker
@@ -258,6 +259,7 @@ impl TextSegment {
                                     target: current_target.target + offset,
                                     location: current_target.location,
                                     has_been_used: true,  // maybe it also just wants to get the pointer, in which case this target will not be used anymore
+                                    is_added: true,
                                 }));
                             }
                         }
@@ -276,10 +278,12 @@ impl TextSegment {
                             }
                             _ => bail!("Unhandled ldr/str instruction mnemonic at 0x{:X}: {}", instr.address(), mnemonic),
                         };
+                        let src_reg = get_operand_mem(&detail, 1)?.base();
                         handle_potential_ref(
                             current_block,
-                            get_operand_mem(&detail, 1)?.base(),
+                            src_reg,
                             get_operand_mem(&detail, 1)?.disp() as i64,
+                            ReferenceSource::LDR_STR(current_block.adrp_targets_at_end.get(&src_reg).is_some_and(|x| x.has_been_used)),
                             instr.address(),
                             target_type,
                             &mut reference_tracker
@@ -323,14 +327,16 @@ impl TextSegment {
                 let mut found = false;
                 for pref in block.potential_refs.iter() {
                     if pref.register == reg {
-                        let source_conflict_resolution = if adrp.has_been_used {
-                            SourceConflictResolution::BlockSource  // no load expected, it's just pointer magic (example: strings)
-                        } else {
-                            SourceConflictResolution::Error
-                        };
+                        let mut source_type = pref.source_type;
+                        if source_type == ReferenceSource::LDR_STR(false) && adrp.is_added {
+                            source_type = ReferenceSource::LDR_STR(true);
+                        }
+                        if source_type == ReferenceSource::ADD(false) && adrp.is_added {
+                            source_type = ReferenceSource::ADD(true);
+                        }
                         //println!("Resolved reference at 0x{:X} using ADRP at 0x{:X}", pref.source_offset, adrp.location);
-                        reference_tracker.add_reference(((adrp.target as i64) + pref.offset) as u64, ReferenceSource::Instruction(pref.source_offset), pref.ref_type, source_conflict_resolution)?;
-                        reference_tracker.add_reference(((adrp.target as i64) + pref.offset) as u64, ReferenceSource::Instruction(adrp.location), pref.ref_type, SourceConflictResolution::KeepFirst)?;
+                        reference_tracker.add_reference(((adrp.target as i64) + pref.offset) as u64, source_type, pref.source_offset, pref.ref_type);
+                        reference_tracker.add_reference(((adrp.target as i64) + pref.offset) as u64, ReferenceSource::ADRP, adrp.location, pref.ref_type);
                         found = true;
                     }
                 }
@@ -381,7 +387,7 @@ impl TextSegment {
         Ok(())
     }
 
-    pub fn export_asm(&self, path: impl AsRef<Path>, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper, mpb: &Option<MultiProgress>, parent: &NSO) -> Result<()> {
+    pub fn export_asm(&self, path: impl AsRef<Path>, references: &References, helper: &NsoLookupHelper, mpb: &Option<MultiProgress>, parent: &NSO) -> Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
         let cs = construct_capstone()?;
@@ -398,7 +404,7 @@ impl TextSegment {
         // TODO .fill {dist}, 1, 0 ???
         while let Some(instr) = iter.next() {
             pb.as_ref().map(|p| p.inc(4));
-            if reference_tracker.get_references_to(instr.address()).is_some() {
+            if references.has_references_to(instr.address()) {
                 // TODO not always mark as `.global {sym}` (for local branches)
                 writeln!(file, "# 0x{:X}:", instr.address())?;
                 writeln!(file, ".global {}", parent.get_symbol(instr.address(), helper)?)?;
@@ -424,9 +430,8 @@ impl TextSegment {
             }
             let detail = cs.insn_detail(&instr)
                 .or_else(|e| bail!("Failed to get instruction detail: {}", e))?;
-            let reference_target = reference_tracker.get_reference_from(ReferenceSource::Instruction(instr.address()))
-                .ok_or(anyhow::anyhow!("No reference found for instruction at 0x{:X}", instr.address()))
-                .map(|(_, target)| target);
+            let reference_target = references.get_target_address(instr.address())
+                .ok_or(anyhow::anyhow!("No reference found for instruction at 0x{:X}", instr.address()));
 
             match mnemonic {
                 // branching/jumps/calls

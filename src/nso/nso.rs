@@ -5,16 +5,16 @@ use binrw::{binread, BinRead, BinReaderExt, NullString};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use num_enum::TryFromPrimitive;
 
-use crate::nso::{nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}, text::TextSegment};
+use crate::{nso::{nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}, text::TextSegment}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}};
 
 pub struct NSO {
     pub file: NsoFile,
     pub text: TextSegment,
     pub build_str: String,
-    pub symbol_table: Vec<DynamicSymbol>,
+    pub symbol_table: (u64, Vec<DynamicSymbol>),
     pub dynamic_segment: Vec<(DynamicTagType, u64)>,
-    pub reloc_dyn_table: Vec<Relocation>,
-    pub reloc_plt_table: Vec<Relocation>,
+    pub reloc_dyn_table: (u64, Vec<Relocation>),  // offset + entries
+    pub reloc_plt_table: (u64, Vec<Relocation>),  // offset + entries
     pub dynstr_table: HashMap<u64, String>,
     pub got_plt_metadata: GotMetadata,
     pub got_metadata: GotMetadata,
@@ -38,7 +38,7 @@ impl NSO {
         let build_str = Self::parse_buildstr(&mut rodata)?;
 
         // .dynsym
-        let symbol_table = Self::parse_dynamic_symbols(&rodata_segment, file.header.dynsym_offset, file.header.dynsym_size)?;
+        let symbol_table = Self::parse_dynamic_symbols(&file.memory, file.header.dynsym_offset + file.header.get_segment_mem_offset(&NsoSegment::Rodata), file.header.dynsym_size)?;
 
         // .dynamic
         let dynamic_offset = (text.module.header_offset + text.module.dyn_offset - file.header.get_segment_mem_offset(&NsoSegment::Data)) as usize;
@@ -66,7 +66,7 @@ impl NSO {
         // .got.plt
         let got_plt_metadata = GotMetadata {
             start_offset: Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_PLTGOT)? as u64,
-            count: reloc_plt_table.iter().filter(|r| r.reloc_type == RelocationType::R_AARCH64_JUMP_SLOT).count() as u64,
+            count: reloc_plt_table.1.iter().filter(|r| r.reloc_type == RelocationType::R_AARCH64_JUMP_SLOT).count() as u64,
         };
         // actually +0x18, but we handle that in export
         // TODO: cleanup
@@ -106,10 +106,10 @@ impl NSO {
         let helper = NsoLookupHelper::new(self)?;
         let mut reference_tracker = ReferenceTracker::new();
 
-        fn call_with_progress(
+        fn call_with_progress<T>(
             m: &Option<MultiProgress>, name: &str, index: usize, total: usize,
-            reference_tracker: &mut ReferenceTracker,
-            f: impl FnOnce(&mut ReferenceTracker, &Option<MultiProgress>) -> anyhow::Result<()>
+            reference_tracker: T,
+            f: impl FnOnce(T, &Option<MultiProgress>) -> anyhow::Result<()>
         ) -> anyhow::Result<()> {
             let pb = m.as_ref().map(|m| {
                 let pb = m.add(indicatif::ProgressBar::new_spinner())
@@ -129,7 +129,7 @@ impl NSO {
             Ok(())
         }
 
-        let function_symbols: HashSet<u64> = self.symbol_table.iter()
+        let function_symbols: HashSet<u64> = self.symbol_table.1.iter()
             .filter(|s| s.get_type().ok() == Some(DynamicSymbolType::STT_FUNC) && s.value != 0)
             .map(|s| s.value)
             .collect();
@@ -150,7 +150,9 @@ impl NSO {
             call_with_progress(&m, name, i+1, total_collect_references, &mut reference_tracker, f)?;
         }
 
-        let export_sections: Vec<(&str, Box<dyn FnMut(&mut ReferenceTracker, &Option<MultiProgress>) -> anyhow::Result<()>>)> = vec![
+        let references = reference_tracker.finalize()?;
+
+        let export_sections: Vec<(&str, Box<dyn FnMut(&References, &Option<MultiProgress>) -> anyhow::Result<()>>)> = vec![
             (".got.plt", Box::new(|_,_| self.export_got_plt(path.join("got.plt.s")))),
             (".got", Box::new(|_,_| self.export_got(path.join("got.s"), &helper))),
             ("external stubs", Box::new(|_,_| self.export_external_stubs(path.join("external.s")))),  // FIXME remove this once all other linker errors are gone and -r/-shared can be used
@@ -168,7 +170,7 @@ impl NSO {
             Some(MultiProgress::new())
         };
         for (i, (name, f)) in export_sections.into_iter().enumerate() {
-            call_with_progress(&m, name, i+1, total_export_sections, &mut reference_tracker, f)?;
+            call_with_progress(&m, name, i+1, total_export_sections, &references, f)?;
         }
 
         Ok(())
@@ -177,7 +179,7 @@ impl NSO {
     pub fn get_symbol(&self, address: u64, helper: &NsoLookupHelper) -> Result<String> {
         // if symbol exists for address, use it
         if let Some(idx) = helper.symbol_table_value_to_idx.get(&address) {
-            let Some(name) = self.dynstr_table.get(&(self.symbol_table[*idx].str_table_offset as u64)) else {
+            let Some(name) = self.dynstr_table.get(&(self.symbol_table.1[*idx].str_table_offset as u64)) else {
                 bail!("Symbol at {:X} has no name", address);
             };
             return Ok(name.clone());
@@ -202,17 +204,17 @@ impl NSO {
         Ok(build_str.to_string())
     }
 
-    fn parse_dynamic_symbols(rodata_segment: &[u8], dynsym_offset: u32, dynsym_size: u32) -> anyhow::Result<Vec<DynamicSymbol>> {
+    fn parse_dynamic_symbols(memory: &[u8], dynsym_offset: u32, dynsym_size: u32) -> anyhow::Result<(u64, Vec<DynamicSymbol>)> {
         let num_symbols = dynsym_size as usize / std::mem::size_of::<DynamicSymbol>();
         let mut symbols = Vec::with_capacity(num_symbols);
         for i in 0..num_symbols {
             let offset = dynsym_offset as usize + i * std::mem::size_of::<DynamicSymbol>();
-            let data = &rodata_segment[offset..offset + std::mem::size_of::<DynamicSymbol>()];
+            let data = &memory[offset..offset + std::mem::size_of::<DynamicSymbol>()];
             let mut cursor = Cursor::new(data);
             let symbol = DynamicSymbol::read_le(&mut cursor)?;
             symbols.push(symbol);
         }
-        Ok(symbols)
+        Ok((dynsym_offset as u64,symbols))
     }
 
     fn parse_dynamic_section(data: &[u8]) -> anyhow::Result<Vec<(DynamicTagType, u64)>> {
@@ -240,9 +242,9 @@ impl NSO {
     fn parse_reloc_table(
         rodata_segment: &[u8], dynamic_segment: &[(DynamicTagType, u64)],
         off_tag: DynamicTagType, size_tag: DynamicTagType, header: &NsoHeader
-    ) -> anyhow::Result<Vec<Relocation>> {
-        let rela_offset = (Self::get_dynamic_tag_value(dynamic_segment, off_tag)?
-            - header.get_segment_mem_offset(&NsoSegment::Rodata) as u64) as usize;
+    ) -> anyhow::Result<(u64, Vec<Relocation>)> {
+        let offset = Self::get_dynamic_tag_value(dynamic_segment, off_tag)?;
+        let rela_offset = (offset - header.get_segment_mem_offset(&NsoSegment::Rodata) as u64) as usize;
         let rela_size = Self::get_dynamic_tag_value(dynamic_segment, size_tag)? as usize;
         let rela_ent = Self::get_dynamic_tag_value(dynamic_segment, DynamicTagType::DT_RELAENT)? as usize;
         ensure!(rela_ent == std::mem::size_of::<Relocation>(), "Unexpected DT_RELAENT size");
@@ -256,7 +258,7 @@ impl NSO {
             let reloc = Relocation::read_le(&mut cursor)?;
             relocations.push(reloc);
         }
-        Ok(relocations)
+        Ok((offset, relocations))
     }
 
     fn parse_dynamic_string_table(rodata_segment: &[u8], dynstr_offset: u32, dynstr_size: u32) -> anyhow::Result<HashMap<u64, String>> {
@@ -279,13 +281,15 @@ impl NSO {
     }
 
     fn ref_types_relocations(&self, reference_tracker: &mut ReferenceTracker) -> anyhow::Result<()> {
-        for relocation in self.reloc_dyn_table.iter() {
+        let (offset, table) = &self.reloc_dyn_table;
+        for (i, relocation) in table.iter().enumerate() {
+            let offset = offset + i as u64 * std::mem::size_of::<Relocation>() as u64;
             match relocation.reloc_type {
                 RelocationType::R_AARCH64_GLOB_DAT | RelocationType::R_AARCH64_ABS64 => {
-                    reference_tracker.add_reference(self.symbol_table[relocation.sym_idx as usize].value, ReferenceSource::Relocation(relocation.offset), DataRefType::Unknown, SourceConflictResolution::Error)?;
+                    reference_tracker.add_reference(self.symbol_table.1[relocation.sym_idx as usize].value, ReferenceSource::Relocation, offset, DataRefType::Unknown);
                 }
                 RelocationType::R_AARCH64_RELATIVE => {
-                    reference_tracker.add_reference(relocation.addend as u64, ReferenceSource::Relocation(relocation.offset), DataRefType::Unknown, SourceConflictResolution::Error)?;
+                    reference_tracker.add_reference(relocation.addend as u64, ReferenceSource::Relocation, offset, DataRefType::Unknown);
                 }
                 _ => bail!("Unsupported relocation type {:?} in .rela.dyn", relocation.reloc_type),
             }
@@ -294,18 +298,20 @@ impl NSO {
     }
 
     fn ref_types_symbols(&self, reference_tracker: &mut ReferenceTracker) -> anyhow::Result<()> {
-        for symbol in self.symbol_table.iter() {
+        let (offset, symbols) = &self.symbol_table;
+        for (i, symbol) in symbols.iter().enumerate() {
             if symbol.value == 0 {
                 continue;  // doesn't point to anything within this binary => not interesting
             }
+            let offset = offset + i as u64 * std::mem::size_of::<DynamicSymbol>() as u64;
             let name = self.dynstr_table.get(&(symbol.str_table_offset as u64));
             let sym_type = symbol.get_type()?;
             match sym_type {
                 DynamicSymbolType::STT_OBJECT => {
-                    reference_tracker.add_reference(symbol.value, ReferenceSource::Symbol, DataRefType::Object(symbol.size), SourceConflictResolution::KeepFirst)?;
+                    reference_tracker.add_reference(symbol.value, ReferenceSource::Symbol, offset, DataRefType::Object(symbol.size));
                 }
                 DynamicSymbolType::STT_FUNC => {
-                    reference_tracker.add_reference(symbol.value, ReferenceSource::Symbol, DataRefType::Function(symbol.size), SourceConflictResolution::KeepFirst)?;
+                    reference_tracker.add_reference(symbol.value, ReferenceSource::Symbol, offset, DataRefType::Function(symbol.size));
                 }
                 DynamicSymbolType::STT_NOTYPE => {
                     ensure!(name.is_some_and(|x| x == "end"),
@@ -326,8 +332,10 @@ impl NSO {
     }
 
     fn ref_types_init_array(&self, reference_tracker: &mut ReferenceTracker) -> anyhow::Result<()> {
-        for (i, &func) in self.init_array.1.iter().enumerate() {
-            reference_tracker.add_reference(func, ReferenceSource::InitArray(i as u64), DataRefType::Code, SourceConflictResolution::Error)?;
+        let (offset, array) = &self.init_array;
+        for (i, &func) in array.iter().enumerate() {
+            let offset = offset + i as u64*8;
+            reference_tracker.add_reference(func, ReferenceSource::InitArray, offset, DataRefType::Code);
         }
         Ok(())
     }
@@ -349,8 +357,8 @@ impl NSO {
         }
 
         for i in 0..self.got_plt_metadata.count {
-            let entry = &self.reloc_plt_table[i as usize];
-            let sym = &self.symbol_table[entry.sym_idx as usize];
+            let entry = &self.reloc_plt_table.1[i as usize];
+            let sym = &self.symbol_table.1[entry.sym_idx as usize];
             let name = &self.dynstr_table[&(sym.str_table_offset as u64)];
             writeln!(file, ".global off_{:X}", got_plt_mem_offset)?;
             writeln!(file, "off_{:X}:", got_plt_mem_offset)?;
@@ -377,11 +385,11 @@ impl NSO {
                 writeln!(file, "")?;
                 continue;
             };
-            let entry = &self.reloc_dyn_table[*entry_index];
+            let entry = &self.reloc_dyn_table.1[*entry_index];
 
             match entry.reloc_type {
                 RelocationType::R_AARCH64_GLOB_DAT | RelocationType::R_AARCH64_ABS64 => {
-                    let sym = &self.symbol_table[entry.sym_idx as usize];
+                    let sym = &self.symbol_table.1[entry.sym_idx as usize];
                     let name = &self.dynstr_table[&(sym.str_table_offset as u64)];
                     writeln!(file, "\t.quad {}", name)?;
                 }
@@ -396,19 +404,19 @@ impl NSO {
         Ok(())
     }
 
-    fn export_init_array(&self, path: impl AsRef<Path>, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper) -> anyhow::Result<()> {
+    fn export_init_array(&self, path: impl AsRef<Path>, references: &References, helper: &NsoLookupHelper) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
         writeln!(file, ".section \".init_array\"")?;
         writeln!(file, "")?;
 
         let (offset, array) = &self.init_array;
-        ensure!(reference_tracker.get_references_to(*offset).is_some(), "No references to .init_array found, but trying to export it");
+        ensure!(references.has_references_to(*offset), "No references to .init_array found, but trying to export it");
         writeln!(file, ".global off_{:X}", offset)?;
         writeln!(file, "off_{:X}:", offset)?;
 
         for (i, &func) in array.iter().enumerate() {
-            ensure!(reference_tracker.get_references_to(offset + i as u64*8).is_none() || i == 0, "Unexpected reference to .init_array entry {} at {:X} found", i, func);
+            ensure!(!references.has_references_to(offset + i as u64*8) || i == 0, "Unexpected reference to .init_array entry {} at {:X} found", i, func);
             ensure!(helper.symbol_table_value_to_idx.get(&func).is_none(), "Unexpected symbol for .init_array entry {} at {:X} found", i, func);
             writeln!(file, "\t.quad {}", self.get_symbol(func, helper)?)?;
         }
@@ -416,7 +424,7 @@ impl NSO {
         Ok(())
     }
 
-    fn export_bss(&self, path: impl AsRef<Path>, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
+    fn export_bss(&self, path: impl AsRef<Path>, references: &References, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
         writeln!(file, ".section \".bss\"")?;
@@ -434,7 +442,7 @@ impl NSO {
             pb.as_ref().map(|p| p.inc(1));
 
             let bss_entry_offset = self.text.module.bss_start as u64 + i;
-            if let Some(_) = reference_tracker.get_references_to(bss_entry_offset) {
+            if references.has_references_to(bss_entry_offset) {
                 let symbol = self.get_symbol(bss_entry_offset, helper)?;
                 writeln!(file, ".global {}", symbol)?;
                 writeln!(file, "{}:", symbol)?;
@@ -450,28 +458,28 @@ impl NSO {
         Ok(())
     }
 
-    fn export_data(&self, path: impl AsRef<Path>, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
+    fn export_data(&self, path: impl AsRef<Path>, references: &References, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         self.export_data_section(
             path,
             ".data",
             &self.file.memory,
             self.text.module.dyn_offset as u64 - self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64,
             self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64,
-            reference_tracker, helper, m
+            references, helper, m
         )
     }
 
-    fn export_rodata(&self, path: impl AsRef<Path>, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
+    fn export_rodata(&self, path: impl AsRef<Path>, references: &References, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         self.export_data_section(path,
             ".rodata",
             &self.file.memory,
             self.file.header.embed_offset as u64 + self.file.header.embed_size as u64 - self.file.header.dynstr_size as u64 - self.file.header.dynstr_offset as u64,
             self.file.header.get_segment_mem_offset(&NsoSegment::Rodata) as u64 + self.file.header.dynstr_offset as u64 + self.file.header.dynstr_size as u64,
-            reference_tracker, helper, m
+            references, helper, m
         )
     }
 
-    fn export_data_section(&self, path: impl AsRef<Path>, name: &str, memory: &[u8], size: u64, offset: u64, reference_tracker: &ReferenceTracker, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
+    fn export_data_section(&self, path: impl AsRef<Path>, name: &str, memory: &[u8], size: u64, offset: u64, references: &References, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
         writeln!(file, ".section \"{}\"", name)?;
@@ -490,7 +498,7 @@ impl NSO {
             
             // TODO: if outgoing reference, format as .quad
             let data_entry_offset = offset + cursor.position();
-            if let Some((data_type, sources)) = reference_tracker.get_references_to(data_entry_offset) {
+            if let Some(data_type) = references.get_type_of(data_entry_offset) {
                 let symbol = self.get_symbol(data_entry_offset, helper)?;
                 writeln!(file, ".global {}", symbol)?;
                 writeln!(file, "{}:", symbol)?;
@@ -512,7 +520,7 @@ impl NSO {
                                 writeln!(file, "\t.quad 0x{:016X}", cursor.read_le::<u64>()?)?;
                             }
                         } else {
-                            for _ in 0..*size {
+                            for _ in 0..size {
                                 writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?;
                             }
                         }
@@ -528,8 +536,8 @@ impl NSO {
             if (cursor_pos+1) < cursor.position() {
                 for skipped_off in (cursor_pos+1)..cursor.position() {
                     let skipped_data_entry_offset = offset + skipped_off;
-                    if let Some((skipped_data_type, skipped_sources)) = reference_tracker.get_references_to(skipped_data_entry_offset) {
-                        bail!("Missed reference to {:X} of type {:?} in {}, referenced by {:?}.", skipped_data_entry_offset, skipped_data_type, name, skipped_sources);
+                    if let Some(skipped_data_type) = references.get_type_of(skipped_data_entry_offset) {
+                        bail!("Missed reference to {:X} of type {:?} in {}.", skipped_data_entry_offset, skipped_data_type, name);
                     }
                 }
             }
@@ -549,9 +557,9 @@ impl NSO {
         writeln!(file, ".section \".external.stubs\"")?;
         writeln!(file, "")?;
 
-        for sym in self.symbol_table.iter() {
+        for sym in self.symbol_table.1.iter() {
             if sym.value != 0 {
-                continue;  // only interested in undefined symbols
+                continue;  // not interested in undefined symbols
             }
             let name = self.dynstr_table.get(&(sym.str_table_offset as u64)).ok_or_else(|| anyhow::anyhow!("Undefined symbol in .dynsym has no name"))?;
             if name == "" {
@@ -759,101 +767,14 @@ pub struct NsoLookupHelper {
 }
 impl NsoLookupHelper {
     pub fn new(nso: &NSO) -> anyhow::Result<Self> {
-        let reloc_dyn_addr_to_idx = nso.reloc_dyn_table.iter().enumerate().map(|(i,r)| (r.offset, i)).collect::<HashMap<_, _>>();
-        ensure!(reloc_dyn_addr_to_idx.len() == nso.reloc_dyn_table.len(), "Duplicate entries in .rela.dyn");
+        let reloc_dyn_addr_to_idx = nso.reloc_dyn_table.1.iter().enumerate().map(|(i,r)| (r.offset, i)).collect::<HashMap<_, _>>();
+        ensure!(reloc_dyn_addr_to_idx.len() == nso.reloc_dyn_table.1.len(), "Duplicate entries in .rela.dyn");
 
-        let symbol_table_value_to_idx = nso.symbol_table.iter().enumerate().map(|(i, sym)| (sym.value, i)).collect::<HashMap<_, _>>();
-        if symbol_table_value_to_idx.len() != nso.symbol_table.len() {
-            println!("Warning: {} duplicate symbol values in symbol table. Using last one when lookups are done.", nso.symbol_table.len() - symbol_table_value_to_idx.len());
+        let symbol_table_value_to_idx = nso.symbol_table.1.iter().enumerate().map(|(i, sym)| (sym.value, i)).collect::<HashMap<_, _>>();
+        if symbol_table_value_to_idx.len() != nso.symbol_table.1.len() {
+            println!("Warning: {} duplicate symbol values in symbol table. Using last one when lookups are done.", nso.symbol_table.1.len() - symbol_table_value_to_idx.len());
         }
 
         Ok(Self { reloc_dyn_addr_to_idx, symbol_table_value_to_idx })
-    }
-}
-
-// top = most specific. If conflicts are found, the lower value (more specific) is used.
-#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
-pub enum DataRefType {
-    Object(u64),   // size in bytes
-    Function(u64), // size in bytes
-    Code,
-    Float8,
-    Int8,
-    Float16,
-    Int16,
-    Float32,
-    Int32,
-    Float64,
-    Int64,
-    Float128,
-    Unknown,
-}
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub enum SourceConflictResolution {
-    Error,  // no conflicts should happen => fail when it does
-    KeepFirst,  // keep the first reference type found, ignore all others (used for `adrp`)
-    BlockSource,  // delete existing reference and prevent future references from the same source (used for `adrp` + `add`/`ldr`)
-}
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum ReferenceSource {
-    Instruction(u64),  // address of instruction
-    Symbol,
-    Relocation(u64),   // offset of relocation
-    InitArray(u64),    // index of init_array entry
-}
-
-pub struct ReferenceTracker {
-    pub references_by_target: HashMap<u64, (DataRefType, HashSet<ReferenceSource>)>,  // target -> (type, sources)
-    pub references_by_source: HashMap<ReferenceSource, (u64, SourceConflictResolution)>,  // source -> (target, resolution)
-}
-impl ReferenceTracker {
-    pub fn new() -> Self {
-        Self {
-            references_by_target: HashMap::new(),
-            references_by_source: HashMap::new(),
-        }
-    }
-
-    // TODO: rewrite this to make more heavy use of ReferenceSource (separate adrp, add, ldr) and remove `SourceConflictResolution`
-    pub fn add_reference(&mut self, target: u64, source: ReferenceSource, data_type: DataRefType, source_conflict_resolution: SourceConflictResolution) -> Result<()> {
-        if let Some((existing_type, sources)) = self.references_by_target.get_mut(&target) {
-            if data_type != *existing_type {
-                *existing_type = std::cmp::min(data_type, *existing_type);
-            }
-            sources.insert(source);
-        } else {
-            self.references_by_target.insert(target, (data_type, HashSet::from([source])));
-        }
-        if let Some((old, old_resolution)) = self.references_by_source.get(&source) && *old != target {
-            ensure!(*old_resolution == source_conflict_resolution, "Source conflict resolution for source {:?} changed from {:?} to {:?}", source, old_resolution, source_conflict_resolution);
-            match source_conflict_resolution {
-                SourceConflictResolution::Error => bail!("Source {:?} already references target 0x{:X}, now tries to reference 0x{:X}", source, old, target),
-                SourceConflictResolution::KeepFirst => {},
-                SourceConflictResolution::BlockSource => {
-                    self.references_by_source.insert(source, (u64::MAX, source_conflict_resolution));  // mark as blocked
-                    // iterate over all targets and remove this source, as `KeepFirst` might have added it to multiple targets
-                    for (_, (_, sources)) in self.references_by_target.iter_mut() {
-                        sources.retain(|s| *s != source);
-                        // keep empty targets, they might be useful for typing
-                    }
-                },
-            }
-        } else {
-            self.references_by_source.insert(source, (target, source_conflict_resolution));
-        }
-        Ok(())
-    }
-
-    pub fn get_references_to(&self, target: u64) -> Option<&(DataRefType, HashSet<ReferenceSource>)> {
-        self.references_by_target.get(&target)
-    }
-
-    pub fn get_reference_from(&self, source: ReferenceSource) -> Option<(DataRefType, u64)> {
-        if let Some((target, _)) = self.references_by_source.get(&source) {
-            if let Some((data_type, _)) = self.references_by_target.get(target) {
-                return Some((*data_type, *target));
-            }
-        }
-        None
     }
 }

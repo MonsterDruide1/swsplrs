@@ -1,4 +1,5 @@
 mod nso;
+mod reference_tracker;
 use crate::nso::{nso::NSO, nso_file::NsoFile};
 
 use argh::FromArgs;
