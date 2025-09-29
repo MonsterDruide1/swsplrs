@@ -2,11 +2,11 @@ use std::{collections::{HashMap, HashSet}, fs::File, io::Cursor, path::Path, u64
 
 use anyhow::{bail, ensure, Result};
 use binrw::{binread, BinRead};
-use capstone::{self, arch::{arm64::{Arm64Operand, Arm64OperandType, Arm64Reg}, ArchOperand, BuildsCapstone, BuildsCapstoneEndian}, InsnGroupId, RegId};
+use capstone::{self, arch::{arm64::{Arm64Operand, Arm64OperandType, Arm64Reg}, ArchOperand, BuildsCapstone, BuildsCapstoneEndian}, Capstone, Insn, InsnGroupId, RegId};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rangemap::RangeMap;
 
-use crate::{nso::nso::{NsoLookupHelper, NSO}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}};
+use crate::{file_list::Object, nso::nso::{NsoLookupHelper, NSO}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}};
 
 pub struct TextSegment {
     pub module: Module,
@@ -411,81 +411,120 @@ impl TextSegment {
                 writeln!(file, "{}:", parent.get_symbol(instr.address(), helper)?)?;
             }
 
-            let Some(mnemonic) = instr.mnemonic() else {
-                bail!("Instruction at 0x{:X} has no mnemonic", instr.address());
-            };
-            if mnemonic == ".byte" {
-                if instr.bytes() == [0xFE, 0xDE, 0xFF, 0xE7] {
-                    //writeln!(file, "\ttrap")?;
-                    writeln!(file, "\t// TRAP instruction")?;
-                    for b in instr.bytes() {
-                        writeln!(file, "\t.byte 0x{:02X}", b)?;
-                    }
-                } else {
-                    for b in instr.bytes() {
-                        writeln!(file, "\t.byte 0x{:02X}", b)?;
-                    }
-                }
-                continue;
-            }
-            let detail = cs.insn_detail(&instr)
-                .or_else(|e| bail!("Failed to get instruction detail: {}", e))?;
-            let reference_target = references.get_target_address(instr.address())
-                .ok_or(anyhow::anyhow!("No reference found for instruction at 0x{:X}", instr.address()));
-
-            match mnemonic {
-                // branching/jumps/calls
-                //  blr, br, ret remain unchanged
-                "bl" | "b" => {
-                    writeln!(file, "\t{} {}", mnemonic, parent.get_symbol(reference_target?, helper)?)?;
-                }
-                "tbz" | "tbnz" => {
-                    writeln!(file, "\t{} {}, #{}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_imm(&detail, 1)?, parent.get_symbol(reference_target?, helper)?)?;
-                }
-                "cbz" | "cbnz" => {
-                    writeln!(file, "\t{} {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, parent.get_symbol(reference_target?, helper)?)?;
-                }
-                s if s.starts_with("b.") => {  // conditionals with b (b.eq, b.ne, b.lt, ...)
-                    writeln!(file, "\t{} {}", mnemonic, parent.get_symbol(reference_target?, helper)?)?;
-                }
-
-                // loads/stores
-                "adr" => {bail!("Unhandled adr instruction at 0x{:X}", instr.address());}
-                "adrp" => {
-                    writeln!(file, "\t{} {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, parent.get_symbol(reference_target?, helper)?)?;
-                }
-                "add" => {
-                    // we are only interested in adds with last operand being an immediate (=> offset)
-                    if let Ok(_) = get_operand_imm(&detail, 2) {
-                        if let Ok(target) = reference_target {
-                            writeln!(file, "\t{} {}, {}, :lo12:{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, parent.get_symbol(target, helper)?)?;
-                        } else {
-                            writeln!(file, "\t{} {}, {}, #{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, get_operand_imm(&detail, 2)?)?;
-                        }
-                    } else {
-                        writeln!(file, "\t{} {}", mnemonic, instr.op_str().ok_or_else(|| anyhow::anyhow!("Failed to get operand string"))?)?;
-                    }
-                }
-                "ldr" | "str" | "ldrh" | "strh" | "ldrb" | "strb" | "ldrsh" => {
-                    let base_reg = get_operand_mem(&detail, 1)?.base();
-                    let base_reg_name = cs.reg_name(base_reg)
-                        .ok_or_else(|| anyhow::anyhow!("Failed to get register name for {:?}", base_reg))?;
-                    if let Ok(target) = reference_target {
-                        //println!("Reference found for memory operand at 0x{:X} to 0x{:X}", instr.address(), target);
-                        writeln!(file, "\t{} {}, [{}, :lo12:{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, parent.get_symbol(target, helper)?)?;
-                    } else {
-                        writeln!(file, "\t{} {}, [{}, #{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, get_operand_mem(&detail, 1)?.disp())?;
-                    }
-                }
-                _ => {
-                    writeln!(file, "\t{} {}", mnemonic, instr.op_str().ok_or_else(|| anyhow::anyhow!("Failed to get operand string"))?)?;
-                }
-            }
+            self.disassemble_instruction(&instr, &mut file, &cs, references, helper, parent)?;
         }
 
         if let Some(pb) = pb {
             pb.set_style(ProgressStyle::with_template("{prefix} {msg}").unwrap());
             pb.finish_with_message("done");
+        }
+
+        Ok(())
+    }
+
+    pub fn export_object_asm(&self, obj: &Object, path: impl AsRef<Path>, references: &References, helper: &NsoLookupHelper, parent: &NSO) -> Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        let cs = construct_capstone()?;
+
+        let start = obj.text_section.iter().map(
+            |info| info.offset as usize
+        ).min().ok_or_else(|| anyhow::anyhow!("Object has no text section entries"))?;
+        let end = obj.text_section.iter().map(
+            |info| (info.offset + info.size) as usize
+        ).max().ok_or_else(|| anyhow::anyhow!("Object has no text section entries"))?;
+
+        let mut iter = cs.disasm_iter(&self.section[start-self.section_offset..end-self.section_offset], start as u64)
+            .or_else(|e| bail!("Failed to disassemble text segment: {}", e))?;
+
+        // TODO .fill {dist}, 1, 0 ???
+        while let Some(instr) = iter.next() {
+            if obj.text_section.iter().any(|info| instr.address() == info.offset as u64) {
+                writeln!(file, "# 0x{:X}:", instr.address())?;
+                writeln!(file, ".global {}", parent.get_symbol(instr.address(), helper)?)?;
+                writeln!(file, "{}:", parent.get_symbol(instr.address(), helper)?)?;
+            } else if references.has_references_to(instr.address()) {
+                writeln!(file, "{}:", parent.get_symbol(instr.address(), helper)?)?;
+            }
+
+            self.disassemble_instruction(&instr, &mut file, &cs, references, helper, parent)?;
+        }
+
+        Ok(())
+    }
+
+    // TODO: return Result<String> instead
+    fn disassemble_instruction(&self, instr: &Insn<'_>, file: &mut File, cs: &Capstone, references: &References, helper: &NsoLookupHelper, parent: &NSO) -> anyhow::Result<()> {
+        use std::io::Write;
+        let Some(mnemonic) = instr.mnemonic() else {
+            bail!("Instruction at 0x{:X} has no mnemonic", instr.address());
+        };
+        if mnemonic == ".byte" {
+            if instr.bytes() == [0xFE, 0xDE, 0xFF, 0xE7] {
+                //writeln!(file, "\ttrap")?;
+                writeln!(file, "\t// TRAP instruction")?;
+                for b in instr.bytes() {
+                    writeln!(file, "\t.byte 0x{:02X}", b)?;
+                }
+            } else {
+                for b in instr.bytes() {
+                    writeln!(file, "\t.byte 0x{:02X}", b)?;
+                }
+            }
+            return Ok(());
+        }
+        let detail = cs.insn_detail(&instr)
+            .or_else(|e| bail!("Failed to get instruction detail: {}", e))?;
+        let reference_target = references.get_target_address(instr.address())
+            .ok_or(anyhow::anyhow!("No reference found for instruction at 0x{:X}", instr.address()));
+
+        match mnemonic {
+            // branching/jumps/calls
+            //  blr, br, ret remain unchanged
+            "bl" | "b" => {
+                writeln!(file, "\t{} {}", mnemonic, parent.get_symbol(reference_target?, helper)?)?;
+            }
+            "tbz" | "tbnz" => {
+                writeln!(file, "\t{} {}, #{}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_imm(&detail, 1)?, parent.get_symbol(reference_target?, helper)?)?;
+            }
+            "cbz" | "cbnz" => {
+                writeln!(file, "\t{} {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, parent.get_symbol(reference_target?, helper)?)?;
+            }
+            s if s.starts_with("b.") => {  // conditionals with b (b.eq, b.ne, b.lt, ...)
+                writeln!(file, "\t{} {}", mnemonic, parent.get_symbol(reference_target?, helper)?)?;
+            }
+
+            // loads/stores
+            "adr" => {bail!("Unhandled adr instruction at 0x{:X}", instr.address());}
+            "adrp" => {
+                writeln!(file, "\t{} {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, parent.get_symbol(reference_target?, helper)?)?;
+            }
+            "add" => {
+                // we are only interested in adds with last operand being an immediate (=> offset)
+                if let Ok(_) = get_operand_imm(&detail, 2) {
+                    if let Ok(target) = reference_target {
+                        writeln!(file, "\t{} {}, {}, :lo12:{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, parent.get_symbol(target, helper)?)?;
+                    } else {
+                        writeln!(file, "\t{} {}, {}, #{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, get_operand_imm(&detail, 2)?)?;
+                    }
+                } else {
+                    writeln!(file, "\t{} {}", mnemonic, instr.op_str().ok_or_else(|| anyhow::anyhow!("Failed to get operand string"))?)?;
+                }
+            }
+            "ldr" | "str" | "ldrh" | "strh" | "ldrb" | "strb" | "ldrsh" => {
+                let base_reg = get_operand_mem(&detail, 1)?.base();
+                let base_reg_name = cs.reg_name(base_reg)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to get register name for {:?}", base_reg))?;
+                if let Ok(target) = reference_target {
+                    //println!("Reference found for memory operand at 0x{:X} to 0x{:X}", instr.address(), target);
+                    writeln!(file, "\t{} {}, [{}, :lo12:{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, parent.get_symbol(target, helper)?)?;
+                } else {
+                    writeln!(file, "\t{} {}, [{}, #{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, get_operand_mem(&detail, 1)?.disp())?;
+                }
+            }
+            _ => {
+                writeln!(file, "\t{} {}", mnemonic, instr.op_str().ok_or_else(|| anyhow::anyhow!("Failed to get operand string"))?)?;
+            }
         }
 
         Ok(())

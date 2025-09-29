@@ -1,11 +1,13 @@
-use std::{collections::{HashMap, HashSet}, fs::{self, File}, io::Cursor, path::Path, time::Duration};
+use std::{collections::{HashMap, HashSet}, fs::{self, File}, io::Cursor, path::Path};
 
 use anyhow::{bail, ensure, Result};
 use binrw::{binread, BinRead, BinReaderExt, NullString};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle, ProgressIterator};
 use num_enum::TryFromPrimitive;
 
-use crate::{nso::{nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}, text::TextSegment}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}};
+use crate::{
+    file_list::Object, nso::{nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}, text::TextSegment}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}, utils::call_with_progress
+};
 
 pub struct NSO {
     pub file: NsoFile,
@@ -102,65 +104,20 @@ impl NSO {
     }
 
     pub fn export_all(&self, path: &Path, no_progress: bool) -> anyhow::Result<()> {
-        fs::create_dir_all(path)?;
+        let references = self.get_references(no_progress)?;
         let helper = NsoLookupHelper::new(self)?;
-        let mut reference_tracker = ReferenceTracker::new();
+        fs::create_dir_all(path)?;
 
-        fn call_with_progress<T>(
-            m: &Option<MultiProgress>, name: &str, index: usize, total: usize,
-            reference_tracker: T,
-            f: impl FnOnce(T, &Option<MultiProgress>) -> anyhow::Result<()>
-        ) -> anyhow::Result<()> {
-            let pb = m.as_ref().map(|m| {
-                let pb = m.add(indicatif::ProgressBar::new_spinner())
-                    .with_style(ProgressStyle::with_template("{prefix} {spinner} {msg}").unwrap())
-                    .with_prefix(format!("  [{}/{}]", index, total))
-                    .with_message(format!("{}: working...", name));
-                pb.enable_steady_tick(Duration::from_millis(50));
-                pb
-            });
-
-            f(reference_tracker, m)?;
-
-            if let Some(pb) = &pb {
-                pb.finish_with_message(format!("{}: done", name));
-            }
-
-            Ok(())
-        }
-
-        let function_symbols: HashSet<u64> = self.symbol_table.1.iter()
-            .filter(|s| s.get_type().ok() == Some(DynamicSymbolType::STT_FUNC) && s.value != 0)
-            .map(|s| s.value)
-            .collect();
-        let collect_references: Vec<(&str, Box<dyn FnMut(&mut ReferenceTracker, &Option<MultiProgress>) -> anyhow::Result<()>>)> = vec![
-            (".rela.dyn", Box::new(|r,_| self.ref_types_relocations(r))),
-            (".dynsym", Box::new(|r,_| self.ref_types_symbols(r))),
-            (".init_array", Box::new(|r,_| self.ref_types_init_array(r))),
-            (".text", Box::new(|r,m| self.text.collect_references(&function_symbols, r, &m))),
-        ];
-        let total_collect_references = collect_references.len();
-
-        let m = if no_progress { None } else {
-            println!(" Step 1 / 2: Collecting references...");
-            Some(MultiProgress::new())
-        };
-        for (i, (name, f)) in collect_references.into_iter().enumerate() {
-            call_with_progress(&m, name, i+1, total_collect_references, &mut reference_tracker, f)?;
-        }
-
-        let references = reference_tracker.finalize()?;
-
-        let export_sections: Vec<(&str, Box<dyn FnMut(&References, &Option<MultiProgress>) -> anyhow::Result<()>>)> = vec![
-            (".got.plt", Box::new(|_,_| self.export_got_plt(path.join("got.plt.s")))),
-            (".got", Box::new(|_,_| self.export_got(path.join("got.s"), &helper))),
-            ("external stubs", Box::new(|_,_| self.export_external_stubs(path.join("external.s")))),  // FIXME remove this once all other linker errors are gone and -r/-shared can be used
-            (".init_array", Box::new(|r,_| self.export_init_array(path.join("init_array.s"), r, &helper))),
-            ("section_start_labels", Box::new(|_,_| self.export_section_start_labels(path.join("section_start_labels.s")))),
-            (".text", Box::new(|r,m| self.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
-            (".bss", Box::new(|r,m| self.export_bss(path.join("bss.s"), r, &helper, m))),
-            (".data", Box::new(|r,m| self.export_data(path.join("data.s"), r, &helper, m))),
-            (".rodata", Box::new(|r,m| self.export_rodata(path.join("rodata.s"), r, &helper, m))),
+        let export_sections: Vec<(&str, Box<dyn FnMut((&References, &Option<MultiProgress>)) -> anyhow::Result<()>>)> = vec![
+            (".got.plt", Box::new(|(_,_)| self.export_got_plt(path.join("got.plt.s")))),
+            (".got", Box::new(|(_,_)| self.export_got(path.join("got.s"), &helper))),
+            ("external stubs", Box::new(|(_,_)| self.export_external_stubs(path.join("external.s")))),  // FIXME remove this once all other linker errors are gone and -r/-shared can be used
+            (".init_array", Box::new(|(r,_)| self.export_init_array(path.join("init_array.s"), r, &helper))),
+            ("section_start_labels", Box::new(|(_,_)| self.export_section_start_labels(path.join("section_start_labels.s")))),
+            (".text", Box::new(|(r,m)| self.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
+            (".bss", Box::new(|(r,m)| self.export_bss(path.join("bss.s"), r, &helper, m))),
+            (".data", Box::new(|(r,m)| self.export_data(path.join("data.s"), r, &helper, m))),
+            (".rodata", Box::new(|(r,m)| self.export_rodata(path.join("rodata.s"), r, &helper, m))),
         ];
         let total_export_sections = export_sections.len();
 
@@ -169,7 +126,39 @@ impl NSO {
             Some(MultiProgress::new())
         };
         for (i, (name, f)) in export_sections.into_iter().enumerate() {
-            call_with_progress(&m, name, i+1, total_export_sections, &references, f)?;
+            call_with_progress(&m, name, i+1, total_export_sections, f, (&references, &m))?;
+        }
+
+        Ok(())
+    }
+
+    pub fn split(&self, file_list: Vec<(String, Object)>, path: &Path, no_progress: bool) -> anyhow::Result<()> {
+        let references = self.get_references(no_progress)?;
+        let helper = NsoLookupHelper::new(self)?;
+        fs::create_dir_all(path)?;
+
+        let m = if no_progress { None } else {
+            println!(" Step 2 / 2: Exporting assembly...");
+            Some(MultiProgress::new())
+        };
+        let pb = m.as_ref().map(|m|
+            m.add(ProgressBar::new(file_list.len() as u64))
+                .with_prefix("   [1/1]")
+                .with_style(ProgressStyle::with_template("{prefix} {message} {wide_bar} {pos}/{len}  ").unwrap())
+        );
+        let iter: Box<dyn Iterator<Item = &(String, Object)>> = if let Some(pb) = pb.clone() {
+            Box::new(file_list.iter().progress_with(pb))
+        } else {
+            Box::new(file_list.iter())
+        };
+
+        for (name, obj) in iter {
+            pb.as_ref().map(|p| p.set_message(format!("Exporting {}", name)));
+            let obj_path = path.join(name);
+            let obj_asm_path = obj_path.join("asm");
+            fs::create_dir_all(&obj_asm_path)?;
+            self.text.export_object_asm(&obj, obj_asm_path.join("text.s"), &references, &helper, &self)?;
+            // TODO: also export other sections, not just .text
         }
 
         Ok(())
@@ -277,6 +266,32 @@ impl NSO {
             init_array.push(u64::read_le(&mut cursor)?);
         }
         Ok(init_array)
+    }
+
+    fn get_references(&self, no_progress: bool) -> anyhow::Result<References> {
+        let mut reference_tracker = ReferenceTracker::new();
+
+        let function_symbols: HashSet<u64> = self.symbol_table.1.iter()
+            .filter(|s| s.get_type().ok() == Some(DynamicSymbolType::STT_FUNC) && s.value != 0)
+            .map(|s| s.value)
+            .collect();
+        let collect_references: Vec<(&str, Box<dyn FnMut((&mut ReferenceTracker, &Option<MultiProgress>)) -> anyhow::Result<()>>)> = vec![
+            (".rela.dyn", Box::new(|(r,_)| self.ref_types_relocations(r))),
+            (".dynsym", Box::new(|(r,_)| self.ref_types_symbols(r))),
+            (".init_array", Box::new(|(r,_)| self.ref_types_init_array(r))),
+            (".text", Box::new(|(r,m)| self.text.collect_references(&function_symbols, r, &m))),
+        ];
+        let total_collect_references = collect_references.len();
+
+        let m = if no_progress { None } else {
+            println!(" Step 1 / 2: Collecting references...");
+            Some(MultiProgress::new())
+        };
+        for (i, (name, f)) in collect_references.into_iter().enumerate() {
+            call_with_progress(&m, name, i+1, total_collect_references, f, (&mut reference_tracker, &m))?;
+        }
+
+        Ok(reference_tracker.finalize()?)
     }
 
     fn ref_types_relocations(&self, reference_tracker: &mut ReferenceTracker) -> anyhow::Result<()> {
