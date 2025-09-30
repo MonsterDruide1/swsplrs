@@ -120,6 +120,8 @@ impl NSO {
             ("section_start_labels", Box::new(|(_,_)| self.export_section_start_labels(path.join("section_start_labels.s")))),
             ("crt0", Box::new(|(_,_)| self.text.export_crt0(path.join("crt0.s")))),
             (".module_name", Box::new(|(_,_)| self.export_module_name(path.join("module_name.s")))),
+            (".rela.dyn", Box::new(|(_,_)| self.export_relocations(path.join("rela.dyn.s"), ".rela.dyn", &self.reloc_dyn_table))),
+            (".rela.plt", Box::new(|(_,_)| self.export_relocations(path.join("rela.plt.s"), ".rela.plt", &self.reloc_plt_table))),
             (".text", Box::new(|(r,m)| self.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
             (".bss", Box::new(|(r,m)| self.export_bss(path.join("bss.s"), r, &helper, m))),
             (".data", Box::new(|(r,m)| self.export_data(path.join("data.s"), r, &helper, m))),
@@ -650,6 +652,22 @@ impl NSO {
         Ok(())
     }
 
+    fn export_relocations(&self, path: impl AsRef<Path>, name: &str, table: &Vec<Relocation>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \"{}\"", name)?;
+        writeln!(file, "")?;
+    
+        for relocation in table.iter() {
+            writeln!(file, ".quad {}", relocation.offset)?;
+            writeln!(file, ".word {}", relocation.reloc_type as u32)?;
+            writeln!(file, ".word {}", relocation.sym_idx)?;
+            writeln!(file, ".quad {}", relocation.addend)?;
+        }
+
+        Ok(())
+    }
+
     fn assemble(&self, output_path: impl AsRef<Path>, input_paths: Vec<impl AsRef<Path>>) -> anyhow::Result<()> {
         let mut cmd = Command::new("aarch64-linux-gnu-as");
         cmd.arg("-o").arg(output_path.as_ref());
@@ -797,7 +815,7 @@ pub struct Relocation {
     pub addend: i64,
 }
 
-#[derive(Debug, BinRead, PartialEq)]
+#[derive(Debug, BinRead, PartialEq, Copy, Clone)]
 #[br(repr = u32)]
 #[allow(non_camel_case_types)]
 pub enum RelocationType {
