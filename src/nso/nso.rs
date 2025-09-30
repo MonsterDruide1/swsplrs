@@ -766,7 +766,7 @@ impl NSO {
             writeln!(file, ".word {}", symbol.str_table_offset)?;
             writeln!(file, ".byte {}", symbol.info)?;
             writeln!(file, ".byte {}", symbol.other)?;
-            writeln!(file, ".half {}", symbol.section_idx)?;
+            writeln!(file, ".short {}", symbol.section_idx)?;
             writeln!(file, ".quad {}", symbol.value)?;
             writeln!(file, ".quad {}", symbol.size)?;
         }
