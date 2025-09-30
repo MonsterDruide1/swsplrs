@@ -139,6 +139,8 @@ impl NSO {
             (".dynamic", Box::new(|(_,_)| self.export_dynamic(path.join("dynamic.s")))),
             (".dynsym", Box::new(|(_,_)| self.export_dynsym(path.join("dynsym.s")))),
             (".dynstr", Box::new(|(_,_)| self.export_dynstr(path.join("dynstr.s")))),
+            (".hash", Box::new(|(_,_)| self.export_hash(path.join("hash.s")))),
+            (".gnu.hash", Box::new(|(_,_)| self.export_gnu_hash(path.join("gnu_hash.s")))),
             (".text", Box::new(|(r,m)| self.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
             (".bss", Box::new(|(r,m)| self.export_bss(path.join("bss.s"), r, &helper, m))),
             (".data", Box::new(|(r,m)| self.export_data(path.join("data.s"), r, &helper, m))),
@@ -782,6 +784,48 @@ impl NSO {
             let value = &self.dynstr_table[&key];
             writeln!(file, ".string \"{}\"", escape_for_asm_string(value))?;
         }
+
+        Ok(())
+    }
+
+    fn export_hash(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \".hash\"")?;
+        writeln!(file, "")?;
+
+        writeln!(file, ".word {}", self.hash_table.nbucket)?;
+        writeln!(file, ".word {}", self.hash_table.nchain)?;
+        for bucket in self.hash_table.buckets.iter() {
+            writeln!(file, ".word {}", bucket)?;
+        }
+        for chain in self.hash_table.chains.iter() {
+            writeln!(file, ".word {}", chain)?;
+        }
+
+        Ok(())
+    }
+
+    fn export_gnu_hash(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \".gnu.hash\"")?;
+        writeln!(file, "")?;
+
+        writeln!(file, ".word {}", self.gnu_hash_table.nbuckets)?;
+        writeln!(file, ".word {}", self.gnu_hash_table.sym_idx)?;
+        writeln!(file, ".word {}", self.gnu_hash_table.mask)?;
+        writeln!(file, ".word {}", self.gnu_hash_table.shift)?;
+        for bloom in self.gnu_hash_table.bloom_filter.iter() {
+            writeln!(file, ".quad {}", bloom)?;
+        }
+        for bucket in self.gnu_hash_table.buckets.iter() {
+            writeln!(file, ".word {}", bucket)?;
+        }
+        for chain in self.gnu_hash_table.chains.iter() {
+            writeln!(file, ".word {}", chain)?;
+        }
+        writeln!(file, ".word 0")?;
 
         Ok(())
     }
