@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, fs::{self, File}, io::Cursor, path::Path, process::Command};
+use std::{collections::{BTreeMap, HashMap, HashSet}, fs::{self, File}, io::Cursor, path::Path, process::Command};
 
 use anyhow::{bail, ensure, Result};
 use binrw::{binread, BinRead, BinReaderExt, NullString};
@@ -17,7 +17,7 @@ pub struct NSO {
     pub dynamic_segment: Vec<(DynamicTagType, u64)>,
     pub reloc_dyn_table: Vec<Relocation>,
     pub reloc_plt_table: Vec<Relocation>,
-    pub dynstr_table: HashMap<u64, String>,
+    pub dynstr_table: BTreeMap<u64, String>,
     pub got_plt_metadata: GotMetadata,
     pub got_metadata: GotMetadata,
     pub init_array: (u64, Vec<u64>),  // offset + entries
@@ -306,10 +306,10 @@ impl NSO {
         Ok(relocations)
     }
 
-    fn parse_dynamic_string_table(rodata_segment: &[u8], dynstr_offset: u32, dynstr_size: u32) -> anyhow::Result<HashMap<u64, String>> {
+    fn parse_dynamic_string_table(rodata_segment: &[u8], dynstr_offset: u32, dynstr_size: u32) -> anyhow::Result<BTreeMap<u64, String>> {
         let str_data = &rodata_segment[dynstr_offset as usize .. (dynstr_offset + dynstr_size) as usize];
         let mut cursor = Cursor::new(str_data);
-        let mut strings = HashMap::new();
+        let mut strings = BTreeMap::new();
         while (cursor.position() as usize) < str_data.len() {
             strings.insert(cursor.position(), cursor.read_le::<NullString>()?.to_string());
         }
@@ -797,7 +797,6 @@ impl NSO {
         use std::io::Write;
         let mut file = File::create(path)?;
         writeln!(file, ".section \".dynstr\"")?;
-        writeln!(file, ".string \"\"")?;  // first entry is always empty string
 
         for key in self.dynstr_table.keys() {
             let value = &self.dynstr_table[&key];
