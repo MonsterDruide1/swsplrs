@@ -760,7 +760,7 @@ impl NSO {
         writeln!(file, "")?;
 
         for (tag, value) in self.dynamic_segment.iter() {
-            writeln!(file, ".quad {:?}", tag)?;
+            writeln!(file, ".quad {}", *tag as u64)?;
             writeln!(file, ".quad {}", value)?;
         }
         writeln!(file, ".quad DT_NULL")?;
