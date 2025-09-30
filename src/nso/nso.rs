@@ -580,7 +580,7 @@ impl NSO {
             path,
             ".data",
             &self.file.memory,
-            self.text.module.dyn_offset as u64 - self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64,
+            self.text.module.header_offset as u64 + self.text.module.dyn_offset as u64 - self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64,
             self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64,
             references, helper, m
         )
