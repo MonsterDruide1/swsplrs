@@ -643,14 +643,9 @@ impl NSO {
     fn export_module_name(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
-        writeln!(file, ".section \".module_name\"")?;
-        writeln!(file, "")?;
-
+        writeln!(file, ".section \".rodata.module_name\"")?;
         writeln!(file, ".quad 0")?;
-        writeln!(file, ".global module_name")?;
-        writeln!(file, "module_name:")?;
-        writeln!(file, "\t.text \"{}\",0", self.build_str)?;
-        writeln!(file, "")?;
+        writeln!(file, ".string \"{}\"", escape_for_asm_string(&self.build_str))?;
 
         Ok(())
     }
@@ -840,4 +835,29 @@ impl NsoLookupHelper {
 
         Ok(Self { reloc_dyn_addr_to_idx, symbol_table_value_to_idx })
     }
+}
+
+fn escape_for_asm_string(s: &str) -> String {
+    let mut escaped = String::new();
+    for c in s.chars() {
+        match c {
+            // Mandatory escapes
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\x07' => escaped.push_str("\\a"), // bell
+            '\x08' => escaped.push_str("\\b"), // backspace
+            '\x0c' => escaped.push_str("\\f"), // formfeed
+            '\x0b' => escaped.push_str("\\v"), // vertical tab
+            '\0' => escaped.push_str("\\0"),   // explicit null if needed
+            c if c.is_control() => {
+                // Use hex for other control characters
+                escaped.push_str(&format!("\\x{:02x}", c as u8));
+            }
+            c => escaped.push(c),
+        }
+    }
+    escaped
 }
