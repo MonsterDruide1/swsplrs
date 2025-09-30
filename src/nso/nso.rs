@@ -764,6 +764,7 @@ impl NSO {
             writeln!(file, ".quad {}", value)?;
         }
         writeln!(file, ".quad DT_NULL")?;
+        writeln!(file, ".quad 0")?;
 
         Ok(())
     }
