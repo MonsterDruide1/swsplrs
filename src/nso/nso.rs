@@ -133,6 +133,7 @@ impl NSO {
             (".init_array", Box::new(|(r,_)| self.export_init_array(path.join("init_array.s"), r, &helper))),
             ("section_start_labels", Box::new(|(_,_)| self.export_section_start_labels(path.join("section_start_labels.s")))),
             ("crt0", Box::new(|(_,_)| self.text.export_crt0(path.join("crt0.s")))),
+            ("unknown data gap", Box::new(|(_,_)| self.export_unknown_data_gap(path.join("unknown_data_gap.s")))),
             (".module_name", Box::new(|(_,_)| self.export_module_name(path.join("module_name.s")))),
             (".rela.dyn", Box::new(|(_,_)| self.export_relocations(path.join("rela.dyn.s"), ".rela.dyn", &self.reloc_dyn_table))),
             (".rela.plt", Box::new(|(_,_)| self.export_relocations(path.join("rela.plt.s"), ".rela.plt", &self.reloc_plt_table))),
@@ -710,6 +711,17 @@ impl NSO {
         writeln!(file, ".global off_{:X}", dynamic)?;
         writeln!(file, "off_{:X}:", dynamic)?;
         writeln!(file, "\t.quad 0")?;
+
+        Ok(())
+    }
+
+    // FIXME: check how this works for other games
+    fn export_unknown_data_gap(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \".unknown.data.gap\"")?;
+        writeln!(file, "")?;
+        writeln!(file, "\t.skip {}", 0x50)?;
 
         Ok(())
     }
