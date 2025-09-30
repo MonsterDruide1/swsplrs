@@ -137,7 +137,7 @@ impl NSO {
         Ok(())
     }
 
-    pub fn split(&self, file_list: Vec<(String, Object)>, path: &Path, no_progress: bool) -> anyhow::Result<()> {
+    pub fn split(&self, file_list: &Vec<(String, Object)>, path: &Path, no_progress: bool) -> anyhow::Result<()> {
         let m = if no_progress { None } else {
             println!(" Step 1 / 3: Collecting references...");
             Some(MultiProgress::new())
@@ -154,7 +154,7 @@ impl NSO {
         let pb = m.as_ref().map(|m|
             m.add(ProgressBar::new(file_list.len() as u64))
                 .with_prefix("   [1/1]")
-                .with_style(ProgressStyle::with_template("{prefix} {msg} {wide_bar} {pos}/{len}  ").unwrap())
+                .with_style(ProgressStyle::with_template("{prefix} {msg:35!} {wide_bar} {pos}/{len}  ").unwrap())
         );
         let iter: Box<dyn Iterator<Item = &(String, Object)>> = if let Some(pb) = pb.clone() {
             Box::new(file_list.iter().progress_with(pb))

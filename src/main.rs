@@ -2,6 +2,7 @@ mod nso;
 mod reference_tracker;
 mod file_list;
 mod utils;
+mod objdiff;
 use crate::nso::{nso::NSO, nso_file::NsoFile};
 
 use argh::FromArgs;
@@ -22,13 +23,25 @@ struct Args {
     /// export individual objects as separate assembly files
     #[argh(switch)]
     split: bool,
+    /// write `objdiff.json` file with configuration for objdiff
+    #[argh(switch)]
+    objdiff: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let args: Args = argh::from_env();
-    println!("Input file: {}", args.input);
+
     println!("Reading NSO file...");
     let nso = NSO::new(NsoFile::new(File::open(&args.input)?)?)?;
+
+    // TODO: make this path configurable
+    let file_list_path = std::path::Path::new("data/file_list.yml");
+    let file_list = if file_list_path.exists() {
+        Some(file_list::parse_file_list(file_list_path)?)
+    } else {
+        None
+    };
+
 
     if args.export_all {
         println!("Exporting all segments to 'out/asm' directory...");
@@ -37,11 +50,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     if args.split {
-        println!("Reading file list...");
-        // TODO: make this path configurable
-        let file_list = file_list::parse_file_list(std::path::Path::new("data/file_list.yml"))?;
         println!("Splitting NSO file...");
-        nso.split(file_list, std::path::Path::new("out/split"), args.no_progress)?;
+        nso.split(file_list.as_ref().expect("File list not found"), std::path::Path::new("out/split"), args.no_progress)?;
+        println!("Done.");
+    }
+
+    if args.objdiff {
+        println!("Writing objdiff.json...");
+        objdiff::write_config(std::path::PathBuf::from("out/objdiff.json"), file_list.as_ref().expect("File list not found"))?;
         println!("Done.");
     }
 
