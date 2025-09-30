@@ -23,6 +23,7 @@ pub struct NSO {
     pub init_array: (u64, Vec<u64>),  // offset + entries
     pub hash_table: HashTable,
     pub gnu_hash_table: GnuHashTable,
+    pub embed: Vec<String>,
 }
 
 impl NSO {
@@ -100,6 +101,9 @@ impl NSO {
             Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_INIT_ARRAYSZ)? / 8
         )?;
 
+        // .embed
+        let embed = Self::parse_embed(&rodata_segment, file.header.embed_offset, file.header.embed_size)?;
+
         Ok(NSO {
             file,
             text,
@@ -114,6 +118,7 @@ impl NSO {
             init_array: (init_array_offset, init_array),
             hash_table,
             gnu_hash_table,
+            embed,
         })
     }
 
@@ -142,6 +147,7 @@ impl NSO {
             (".dynstr", Box::new(|(_,_)| self.export_dynstr(path.join("dynstr.s")))),
             (".hash", Box::new(|(_,_)| self.export_hash(path.join("hash.s")))),
             (".gnu.hash", Box::new(|(_,_)| self.export_gnu_hash(path.join("gnu_hash.s")))),
+            (".embed", Box::new(|(_,_)| self.export_embed(path.join("embed.s")))),
             (".text", Box::new(|(r,m)| self.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
             (".bss", Box::new(|(r,m)| self.export_bss(path.join("bss.s"), r, &helper, m))),
             (".data", Box::new(|(r,m)| self.export_data(path.join("data.s"), r, &helper, m))),
@@ -378,6 +384,16 @@ impl NSO {
         })
     }
 
+    fn parse_embed(rodata_segment: &[u8], embed_offset: u32, embed_size: u32) -> anyhow::Result<Vec<String>> {
+        let embed_data = &rodata_segment[embed_offset as usize .. (embed_offset + embed_size) as usize];
+        let mut cursor = Cursor::new(embed_data);
+        let mut strings = Vec::new();
+        while (cursor.position() as usize) < embed_data.len() {
+            strings.push(cursor.read_le::<NullString>()?.to_string());
+        }
+        Ok(strings)
+    }
+
     fn get_references(&self, m: Option<MultiProgress>) -> anyhow::Result<References> {
         let mut reference_tracker = ReferenceTracker::new();
 
@@ -597,7 +613,7 @@ impl NSO {
         self.export_data_section(path,
             ".rodata",
             &self.file.memory,
-            self.file.header.embed_offset as u64 + self.file.header.embed_size as u64 - self.file.header.dynstr_size as u64 - self.file.header.dynstr_offset as u64,
+            self.file.header.embed_offset as u64 - self.file.header.dynstr_size as u64 - self.file.header.dynstr_offset as u64,
             self.file.header.get_segment_mem_offset(&NsoSegment::Rodata) as u64 + self.file.header.dynstr_offset as u64 + self.file.header.dynstr_size as u64,
             references, helper, m
         )
@@ -844,6 +860,18 @@ impl NSO {
             writeln!(file, ".word {}", chain)?;
         }
         writeln!(file, ".word 0")?;
+
+        Ok(())
+    }
+
+    fn export_embed(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \".embed\"")?;
+
+        for value in self.embed.iter() {
+            writeln!(file, ".string \"{}\"", escape_for_asm_string(value))?;
+        }
 
         Ok(())
     }
