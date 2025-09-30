@@ -116,9 +116,10 @@ impl NSO {
         let export_sections: Vec<(&str, Box<dyn FnMut((&References, &Option<MultiProgress>)) -> anyhow::Result<()>>)> = vec![
             (".got.plt", Box::new(|(_,_)| self.export_got_plt(path.join("got.plt.s")))),
             (".got", Box::new(|(_,_)| self.export_got(path.join("got.s"), &helper))),
-            ("external stubs", Box::new(|(_,_)| self.export_external_stubs(path.join("external.s")))),  // FIXME remove this once all other linker errors are gone and -r/-shared can be used
             (".init_array", Box::new(|(r,_)| self.export_init_array(path.join("init_array.s"), r, &helper))),
             ("section_start_labels", Box::new(|(_,_)| self.export_section_start_labels(path.join("section_start_labels.s")))),
+            ("crt0", Box::new(|(_,_)| self.text.export_crt0(path.join("crt0.s")))),
+            (".module_name", Box::new(|(_,_)| self.export_module_name(path.join("module_name.s")))),
             (".text", Box::new(|(r,m)| self.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
             (".bss", Box::new(|(r,m)| self.export_bss(path.join("bss.s"), r, &helper, m))),
             (".data", Box::new(|(r,m)| self.export_data(path.join("data.s"), r, &helper, m))),
@@ -595,30 +596,6 @@ impl NSO {
         Ok(())
     }
 
-    fn export_external_stubs(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
-        use std::io::Write;
-        let mut file = File::create(path)?;
-        writeln!(file, ".section \".external.stubs\"")?;
-        writeln!(file, "")?;
-
-        for sym in self.symbol_table.1.iter() {
-            if sym.value != 0 {
-                continue;  // not interested in undefined symbols
-            }
-            let name = self.dynstr_table.get(&(sym.str_table_offset as u64)).ok_or_else(|| anyhow::anyhow!("Undefined symbol in .dynsym has no name"))?;
-            if name == "" {
-                continue;  // skip empty names
-            }
-            writeln!(file, ".global {}", name)?;
-            writeln!(file, "{}:", name)?;
-            writeln!(file, "\tbrk #0")?;
-            writeln!(file, "\tret")?;
-            writeln!(file, "")?;
-        }
-
-        Ok(())
-    }
-
     // FIXME: figure out how to properly generate these labels
     fn export_section_start_labels(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         // names from https://github.com/shinyquagsire23/switch-oss/blob/171a7426a95def81c4abf038730130f9e13c6788/src/rocrt_nro.cpp#L116
@@ -659,6 +636,21 @@ impl NSO {
         writeln!(file, ".global off_{:X}", dynamic)?;
         writeln!(file, "off_{:X}:", dynamic)?;
         writeln!(file, "\t.quad 0")?;
+
+        Ok(())
+    }
+
+    fn export_module_name(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \".module_name\"")?;
+        writeln!(file, "")?;
+
+        writeln!(file, ".quad 0")?;
+        writeln!(file, ".global module_name")?;
+        writeln!(file, "module_name:")?;
+        writeln!(file, "\t.text \"{}\",0", self.build_str)?;
+        writeln!(file, "")?;
 
         Ok(())
     }
