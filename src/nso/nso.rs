@@ -664,18 +664,25 @@ impl NSO {
     }
 
     fn assemble(&self, output_path: impl AsRef<Path>, input_paths: Vec<impl AsRef<Path>>) -> anyhow::Result<()> {
-        // FIXME: generic binary path, not hardcoded to my setup
-        let mut cmd = Command::new("/home/monsterdruide1/clang-versions/clang-3.9.1/bin/llvm-mc");
+        let mut cmd = Command::new("aarch64-linux-gnu-as");
         cmd.arg("-o").arg(output_path.as_ref());
         for input in input_paths {
             cmd.arg(input.as_ref());
         }
-        // only required for GNU-as: cmd.arg("-r");  // relocatable = ignore undefined symbols
-        cmd.arg("--filetype=obj");
-        cmd.arg("--arch=aarch64");
         let output = cmd.output()?;
         ensure!(output.status.success(), 
             "Failed to assemble {}: {}\n{}",
+            output_path.as_ref().display(),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        
+        let mut cmd = Command::new("aarch64-linux-gnu-strip");
+        cmd.arg("-x");
+        cmd.arg(output_path.as_ref());
+        let output = cmd.output()?;
+        ensure!(output.status.success(), 
+            "Failed to strip {}: {}\n{}",
             output_path.as_ref().display(),
             String::from_utf8_lossy(&output.stderr),
             String::from_utf8_lossy(&output.stdout)
