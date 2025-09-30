@@ -122,6 +122,7 @@ impl NSO {
             (".module_name", Box::new(|(_,_)| self.export_module_name(path.join("module_name.s")))),
             (".rela.dyn", Box::new(|(_,_)| self.export_relocations(path.join("rela.dyn.s"), ".rela.dyn", &self.reloc_dyn_table))),
             (".rela.plt", Box::new(|(_,_)| self.export_relocations(path.join("rela.plt.s"), ".rela.plt", &self.reloc_plt_table))),
+            (".dynamic", Box::new(|(_,_)| self.export_dynamic(path.join("dynamic.s")))),
             (".text", Box::new(|(r,m)| self.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
             (".bss", Box::new(|(r,m)| self.export_bss(path.join("bss.s"), r, &helper, m))),
             (".data", Box::new(|(r,m)| self.export_data(path.join("data.s"), r, &helper, m))),
@@ -660,10 +661,26 @@ impl NSO {
     
         for relocation in table.iter() {
             writeln!(file, ".quad {}", relocation.offset)?;
+            // TODO: check if these two must be flipped
             writeln!(file, ".word {}", relocation.reloc_type as u32)?;
             writeln!(file, ".word {}", relocation.sym_idx)?;
             writeln!(file, ".quad {}", relocation.addend)?;
         }
+
+        Ok(())
+    }
+    
+    fn export_dynamic(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \".dynamic\"")?;
+        writeln!(file, "")?;
+
+        for (tag, value) in self.dynamic_segment.iter() {
+            writeln!(file, ".quad {:?}", tag)?;
+            writeln!(file, ".quad {}", value)?;
+        }
+        writeln!(file, ".quad DT_NULL")?;
 
         Ok(())
     }
@@ -749,7 +766,7 @@ impl DynamicSymbol {
 
 
 #[repr(u64)]
-#[derive(Debug, TryFromPrimitive, PartialEq)]
+#[derive(Debug, TryFromPrimitive, PartialEq, Clone, Copy)]
 #[allow(non_camel_case_types)]
 pub enum DynamicTagType {
     DT_NULL = 0,
