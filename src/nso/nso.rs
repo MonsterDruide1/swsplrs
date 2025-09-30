@@ -123,6 +123,8 @@ impl NSO {
             (".rela.dyn", Box::new(|(_,_)| self.export_relocations(path.join("rela.dyn.s"), ".rela.dyn", &self.reloc_dyn_table))),
             (".rela.plt", Box::new(|(_,_)| self.export_relocations(path.join("rela.plt.s"), ".rela.plt", &self.reloc_plt_table))),
             (".dynamic", Box::new(|(_,_)| self.export_dynamic(path.join("dynamic.s")))),
+            (".dynsym", Box::new(|(_,_)| self.export_dynsym(path.join("dynsym.s")))),
+            (".dynstr", Box::new(|(_,_)| self.export_dynstr(path.join("dynstr.s")))),
             (".text", Box::new(|(r,m)| self.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
             (".bss", Box::new(|(r,m)| self.export_bss(path.join("bss.s"), r, &helper, m))),
             (".data", Box::new(|(r,m)| self.export_data(path.join("data.s"), r, &helper, m))),
@@ -681,6 +683,38 @@ impl NSO {
             writeln!(file, ".quad {}", value)?;
         }
         writeln!(file, ".quad DT_NULL")?;
+
+        Ok(())
+    }
+
+    fn export_dynsym(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \".dynsym\"")?;
+        writeln!(file, "")?;
+
+        for symbol in self.symbol_table.1.iter() {
+            writeln!(file, ".word {}", symbol.str_table_offset)?;
+            writeln!(file, ".byte {}", symbol.info)?;
+            writeln!(file, ".byte {}", symbol.other)?;
+            writeln!(file, ".half {}", symbol.section_idx)?;
+            writeln!(file, ".quad {}", symbol.value)?;
+            writeln!(file, ".quad {}", symbol.size)?;
+        }
+
+        Ok(())
+    }
+
+    fn export_dynstr(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \".dynstr\"")?;
+        writeln!(file, ".string \"\"")?;  // first entry is always empty string
+
+        for key in self.dynstr_table.keys() {
+            let value = &self.dynstr_table[&key];
+            writeln!(file, ".string \"{}\"", escape_for_asm_string(value))?;
+        }
 
         Ok(())
     }
