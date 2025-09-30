@@ -500,8 +500,14 @@ impl NSO {
             writeln!(file, "off_{:X}:", got_entry_offset)?;
 
             let Some(entry_index) = helper.reloc_dyn_addr_to_idx.get(&got_entry_offset) else {
-                writeln!(file, "")?;
-                continue;
+                if i == 0 {
+                    // FIXME: actually handle this first one properly
+                    writeln!(file, "\t.quad 0")?;
+                    writeln!(file, "")?;
+                    continue;
+                } else {
+                    bail!("No relocation entry found for .got entry at {:X}", got_entry_offset);
+                }
             };
             let entry = &self.reloc_dyn_table[*entry_index];
 
