@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, fs::{self, File}, io::Cursor, path::Path};
+use std::{collections::{HashMap, HashSet}, fs::{self, File}, io::Cursor, path::Path, process::Command};
 
 use anyhow::{bail, ensure, Result};
 use binrw::{binread, BinRead, BinReaderExt, NullString};
@@ -104,7 +104,12 @@ impl NSO {
     }
 
     pub fn export_all(&self, path: &Path, no_progress: bool) -> anyhow::Result<()> {
-        let references = self.get_references(no_progress)?;
+        let m = if no_progress { None } else {
+            println!(" Step 1 / 2: Collecting references...");
+            Some(MultiProgress::new())
+        };
+
+        let references = self.get_references(m)?;
         let helper = NsoLookupHelper::new(self)?;
         fs::create_dir_all(path)?;
 
@@ -133,18 +138,23 @@ impl NSO {
     }
 
     pub fn split(&self, file_list: Vec<(String, Object)>, path: &Path, no_progress: bool) -> anyhow::Result<()> {
-        let references = self.get_references(no_progress)?;
+        let m = if no_progress { None } else {
+            println!(" Step 1 / 3: Collecting references...");
+            Some(MultiProgress::new())
+        };
+
+        let references = self.get_references(m)?;
         let helper = NsoLookupHelper::new(self)?;
         fs::create_dir_all(path)?;
 
         let m = if no_progress { None } else {
-            println!(" Step 2 / 2: Exporting assembly...");
+            println!(" Step 2 / 3: Exporting assembly...");
             Some(MultiProgress::new())
         };
         let pb = m.as_ref().map(|m|
             m.add(ProgressBar::new(file_list.len() as u64))
                 .with_prefix("   [1/1]")
-                .with_style(ProgressStyle::with_template("{prefix} {message} {wide_bar} {pos}/{len}  ").unwrap())
+                .with_style(ProgressStyle::with_template("{prefix} {msg} {wide_bar} {pos}/{len}  ").unwrap())
         );
         let iter: Box<dyn Iterator<Item = &(String, Object)>> = if let Some(pb) = pb.clone() {
             Box::new(file_list.iter().progress_with(pb))
@@ -159,6 +169,30 @@ impl NSO {
             fs::create_dir_all(&obj_asm_path)?;
             self.text.export_object_asm(&obj, obj_asm_path.join("text.s"), &references, &helper, &self)?;
             // TODO: also export other sections, not just .text
+        }
+
+        let m = if no_progress { None } else {
+            println!(" Step 3 / 3: Assembling assembly...");
+            Some(MultiProgress::new())
+        };
+        let pb = m.as_ref().map(|m|
+            m.add(ProgressBar::new(file_list.len() as u64))
+                .with_prefix("   [1/1]")
+                .with_style(ProgressStyle::with_template("{prefix} {msg:35!} {wide_bar} {pos}/{len}  ").unwrap())
+        );
+        let iter: Box<dyn Iterator<Item = &(String, Object)>> = if let Some(pb) = pb.clone() {
+            Box::new(file_list.iter().progress_with(pb))
+        } else {
+            Box::new(file_list.iter())
+        };
+
+        for (name, _) in iter {
+            pb.as_ref().map(|p| p.set_message(name.clone()));
+            let obj_path = path.join(name);
+            let obj_asm_path = obj_path.join("asm");
+            let obj_name = if name.contains("/") { name.rsplit_once('/').unwrap().1.to_owned() } else { name.to_owned() };
+            self.assemble(obj_path.join(obj_name), vec![obj_asm_path.join("text.s")])?;
+            // TODO: also assemble other sections, not just .text
         }
 
         Ok(())
@@ -268,7 +302,7 @@ impl NSO {
         Ok(init_array)
     }
 
-    fn get_references(&self, no_progress: bool) -> anyhow::Result<References> {
+    fn get_references(&self, m: Option<MultiProgress>) -> anyhow::Result<References> {
         let mut reference_tracker = ReferenceTracker::new();
 
         let function_symbols: HashSet<u64> = self.symbol_table.1.iter()
@@ -283,10 +317,6 @@ impl NSO {
         ];
         let total_collect_references = collect_references.len();
 
-        let m = if no_progress { None } else {
-            println!(" Step 1 / 2: Collecting references...");
-            Some(MultiProgress::new())
-        };
         for (i, (name, f)) in collect_references.into_iter().enumerate() {
             call_with_progress(&m, name, i+1, total_collect_references, f, (&mut reference_tracker, &m))?;
         }
@@ -630,6 +660,26 @@ impl NSO {
         writeln!(file, "off_{:X}:", dynamic)?;
         writeln!(file, "\t.quad 0")?;
 
+        Ok(())
+    }
+
+    fn assemble(&self, output_path: impl AsRef<Path>, input_paths: Vec<impl AsRef<Path>>) -> anyhow::Result<()> {
+        // FIXME: generic binary path, not hardcoded to my setup
+        let mut cmd = Command::new("/home/monsterdruide1/clang-versions/clang-3.9.1/bin/llvm-mc");
+        cmd.arg("-o").arg(output_path.as_ref());
+        for input in input_paths {
+            cmd.arg(input.as_ref());
+        }
+        // only required for GNU-as: cmd.arg("-r");  // relocatable = ignore undefined symbols
+        cmd.arg("--filetype=obj");
+        cmd.arg("--arch=aarch64");
+        let output = cmd.output()?;
+        ensure!(output.status.success(), 
+            "Failed to assemble {}: {}\n{}",
+            output_path.as_ref().display(),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
         Ok(())
     }
 }
