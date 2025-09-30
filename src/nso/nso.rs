@@ -867,7 +867,7 @@ impl NSO {
     fn export_embed(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
-        writeln!(file, ".section \".embed\"")?;
+        writeln!(file, ".section \".embed\", \"a\"")?;
 
         for value in self.embed.iter() {
             writeln!(file, ".string \"{}\"", escape_for_asm_string(value))?;
