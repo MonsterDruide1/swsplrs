@@ -21,6 +21,8 @@ pub struct NSO {
     pub got_plt_metadata: GotMetadata,
     pub got_metadata: GotMetadata,
     pub init_array: (u64, Vec<u64>),  // offset + entries
+    pub hash_table: HashTable,
+    pub gnu_hash_table: GnuHashTable,
 }
 
 impl NSO {
@@ -48,7 +50,17 @@ impl NSO {
             &data_segment[dynamic_offset..]
         )?;
 
-        // skip .hash and .gnu_hash for now
+        // .hash
+        let hash_table = Self::parse_hash_table(
+            &file.memory,
+            Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_HASH)? as u32
+        )?;
+
+        // .gnu.hash
+        let gnu_hash_table = Self::parse_gnu_hash_table(
+            &file.memory,
+            Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_GNU_HASH)? as u32
+        )?;
 
         // .rela.dyn
         let reloc_dyn_table = Self::parse_reloc_table(
@@ -100,6 +112,8 @@ impl NSO {
             got_plt_metadata,
             got_metadata,
             init_array: (init_array_offset, init_array),
+            hash_table,
+            gnu_hash_table,
         })
     }
 
@@ -306,6 +320,59 @@ impl NSO {
             init_array.push(u64::read_le(&mut cursor)?);
         }
         Ok(init_array)
+    }
+
+    fn parse_hash_table(memory: &[u8], hash_offset: u32) -> anyhow::Result<HashTable> {
+        let mut cursor = Cursor::new(&memory[hash_offset as usize ..]);
+        let nbucket: u32 = cursor.read_le()?;
+        let nchain: u32 = cursor.read_le()?;
+        let mut buckets = Vec::with_capacity(nbucket as usize);
+        for _ in 0..nbucket {
+            buckets.push(u32::read_le(&mut cursor)?);
+        }
+        let mut chains = Vec::with_capacity(nchain as usize);
+        for _ in 0..nchain {
+            chains.push(u32::read_le(&mut cursor)?);
+        }
+        Ok(HashTable {
+            nbucket,
+            nchain,
+            buckets,
+            chains,
+        })
+    }
+
+    fn parse_gnu_hash_table(memory: &[u8], gnu_hash_offset: u32) -> anyhow::Result<GnuHashTable> {
+        let mut cursor = Cursor::new(&memory[gnu_hash_offset as usize ..]);
+        let nbuckets: u32 = cursor.read_le()?;
+        let sym_idx: u32 = cursor.read_le()?;
+        let mask: u32 = cursor.read_le()?;
+        let shift: u32 = cursor.read_le()?;
+        let mut bloom_filter = Vec::with_capacity(mask as usize);
+        for _ in 0..mask {
+            bloom_filter.push(u64::read_le(&mut cursor)?);
+        }
+        let mut buckets = Vec::with_capacity(nbuckets as usize);
+        for _ in 0..nbuckets {
+            buckets.push(u32::read_le(&mut cursor)?);
+        }
+        let mut chains = Vec::new();
+        loop {
+            let val = u32::read_le(&mut cursor)?;
+            if val == 0 {
+                break;
+            }
+            chains.push(val);
+        }
+        Ok(GnuHashTable {
+            nbuckets,
+            sym_idx,
+            mask,
+            shift,
+            bloom_filter,
+            buckets,
+            chains,
+        })
     }
 
     fn get_references(&self, m: Option<MultiProgress>) -> anyhow::Result<References> {
@@ -878,6 +945,25 @@ pub enum RelocationType {
     R_AARCH64_TLS_DTPREL32 = 1031,
     R_AARCH64_IRELATIVE = 1032,
     R_AARCH64_ABS64 = 257
+}
+
+#[derive(Debug)]
+pub struct HashTable {
+    pub nbucket: u32,
+    pub nchain: u32,
+    pub buckets: Vec<u32>,
+    pub chains: Vec<u32>,
+}
+
+#[derive(Debug)]
+pub struct GnuHashTable {
+    pub nbuckets: u32,
+    pub sym_idx: u32,
+    pub mask: u32,
+    pub shift: u32,
+    pub bloom_filter: Vec<u64>,
+    pub buckets: Vec<u32>,
+    pub chains: Vec<u32>,
 }
 
 #[derive(Debug)]

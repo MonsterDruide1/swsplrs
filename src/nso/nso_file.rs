@@ -27,17 +27,17 @@ impl NsoFile {
             && header.get_segment_mem_offset(&NsoSegment::Rodata) < header.get_segment_mem_offset(&NsoSegment::Data),
             "Segments are not in the expected order");
 
-        let mut binary = vec![0; (header.get_segment_mem_offset(&NsoSegment::Data) + header.get_segment_mem_size(&NsoSegment::Data)) as usize];
-        binary[header.get_segment_mem_offset(&NsoSegment::Text) as usize .. (header.get_segment_mem_offset(&NsoSegment::Text) + header.get_segment_mem_size(&NsoSegment::Text)) as usize]
+        let mut memory = vec![0; (header.get_segment_mem_offset(&NsoSegment::Data) + header.get_segment_mem_size(&NsoSegment::Data)) as usize];
+        memory[header.get_segment_mem_offset(&NsoSegment::Text) as usize .. (header.get_segment_mem_offset(&NsoSegment::Text) + header.get_segment_mem_size(&NsoSegment::Text)) as usize]
             .copy_from_slice(&text_segment);
-        binary[header.get_segment_mem_offset(&NsoSegment::Rodata) as usize .. (header.get_segment_mem_offset(&NsoSegment::Rodata) + header.get_segment_mem_size(&NsoSegment::Rodata)) as usize]
+        memory[header.get_segment_mem_offset(&NsoSegment::Rodata) as usize .. (header.get_segment_mem_offset(&NsoSegment::Rodata) + header.get_segment_mem_size(&NsoSegment::Rodata)) as usize]
             .copy_from_slice(&rodata_segment);
-        binary[header.get_segment_mem_offset(&NsoSegment::Data) as usize .. (header.get_segment_mem_offset(&NsoSegment::Data) + header.get_segment_mem_size(&NsoSegment::Data)) as usize]
+        memory[header.get_segment_mem_offset(&NsoSegment::Data) as usize .. (header.get_segment_mem_offset(&NsoSegment::Data) + header.get_segment_mem_size(&NsoSegment::Data)) as usize]
             .copy_from_slice(&data_segment);
 
         Ok(Self {
             header,
-            memory: binary,
+            memory,
         })
     }
 
@@ -70,21 +70,21 @@ impl NsoFile {
 }
 
 // list/order from https://github.com/h1k421/GLoat/blob/master/libgloat/application.ld
-// with slight adjustments based on nxo64.py and swspl
+// with slight adjustments based on nxo64.py, swspl and SMO's segment order
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SectionType {
     Text,
     Plt,
     ModuleName,
-    Rodata,
-    Hash,
-    GnuHash,
-    Dynsym,
-    Dynstr,
     RelDyn,
     RelaDyn,
     RelPlt,
     RelaPlt,
+    Hash,
+    GnuHash,
+    Dynsym,
+    Dynstr,
+    Rodata,
     GccExceptTable,
     EhFrameHdr,
     EhFrame,
