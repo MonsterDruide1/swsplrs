@@ -15,9 +15,10 @@ pub struct TextSegment {
 }
 impl TextSegment {
     pub fn new(text: &[u8]) -> Self {
-        let module = Module::read_le(&mut Cursor::new(text)).unwrap();
+        let mut cursor = Cursor::new(text);
+        let module = Module::read_le(&mut cursor).unwrap();
         // TODO: potentially read all 0-bytes until *actual* start of section
-        let section_offset = std::mem::size_of::<Module>();
+        let section_offset = cursor.position() as usize;
         let section = text[section_offset..].to_vec();
 
         Self { module, section, section_offset }
