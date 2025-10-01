@@ -581,7 +581,7 @@ impl NSO {
         for i in 0..(bss_size+8) {
             pb.as_ref().map(|p| p.inc(1));
 
-            let bss_entry_offset = self.text.module.bss_start as u64 + i;
+            let bss_entry_offset = self.text.module.bss_start as u64 + self.text.module.header_offset as u64 + i;
             if references.has_references_to(bss_entry_offset) {
                 let symbol = self.get_symbol(bss_entry_offset, helper)?;
                 writeln!(file, ".global {}", symbol)?;
