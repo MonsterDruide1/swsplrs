@@ -1,0 +1,38 @@
+{
+    "configurations": [
+        {
+            "type": "cppdbg",
+            "request": "launch",
+            "name": "export all SMO-1.0-compressed",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/target/debug/swsplrs",
+            "environment": [
+                {
+                    "name": "RUST_BACKTRACE",
+                    "value": "short"
+                },
+                {
+                    "name": "RUSTC_TOOLCHAIN",
+                    "value": "/home/monsterdruide1/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu"
+                },
+                {
+                    "name": "PATH",
+                    "value": "/home/monsterdruide1/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin:/home/monsterdruide1/.local/bin:/usr/local/bin:/usr/bin:/bin:/home/monsterdruide1/.cargo/bin"
+                },
+                {
+                    "name": "RUSTUP_HOME",
+                    "value": "/home/monsterdruide1/.cargo/bin"
+                },
+                {
+                    "name": "CARGO_HOME",
+                    "value": "/home/monsterdruide1/.cargo/bin"
+                }
+            ],
+            "args": ["~/smo-main-1.0-compressed.nso", "--export-all"],
+            "sourceFileMap": {},
+            "osx": {
+                "MIMode": "lldb"
+            }
+        }
+    ]
+}
