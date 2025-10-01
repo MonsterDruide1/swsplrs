@@ -16,6 +16,7 @@ pub enum DataRefType {
     Float64,
     Int64,
     Float128,
+    SymbolAbsolute(i64), // absolute address, addend
     Unknown,
 }
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]

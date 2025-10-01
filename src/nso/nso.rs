@@ -438,9 +438,11 @@ impl NSO {
         for relocation in self.reloc_dyn_table.iter() {
             match relocation.reloc_type {
                 RelocationType::R_AARCH64_GLOB_DAT | RelocationType::R_AARCH64_ABS64 => {
-                    reference_tracker.add_reference(self.symbol_table.1[relocation.sym_idx as usize].value, ReferenceSource::Relocation, relocation.offset, DataRefType::Unknown);
+                    let symbol_offset = self.symbol_table.0 + relocation.sym_idx as u64 * std::mem::size_of::<DynamicSymbol>() as u64;
+                    reference_tracker.add_reference(symbol_offset, ReferenceSource::Relocation, relocation.offset, DataRefType::SymbolAbsolute(relocation.addend));
                 }
                 RelocationType::R_AARCH64_RELATIVE => {
+                    ensure!(relocation.addend >= 0, "Addend in R_AARCH64_RELATIVE relocation must not be negative!");
                     reference_tracker.add_reference(relocation.addend as u64, ReferenceSource::Relocation, relocation.offset, DataRefType::Unknown);
                 }
                 _ => bail!("Unsupported relocation type {:?} in .rela.dyn", relocation.reloc_type),
@@ -661,14 +663,27 @@ impl NSO {
                 writeln!(file, "{}:", symbol)?;
             }
             if let Some(target) = references.get_target_address(data_entry_offset) {
-                let data = cursor.read_le::<u64>()?;
-                // TODO figure out why this doesn't work/what is expected there
-                //ensure!(target == data, "Reference at {:X} points to {:X}, but data is {:X}", data_entry_offset, target, data);
-                // references are either objects (by symbols), unknown (by references) or int64 (by 64-bit loads)
-                ensure!(references.get_type_of(data_entry_offset).is_none_or(|x| matches!(x, DataRefType::Object(_) | DataRefType::Unknown | DataRefType::Int64)),
-                    "Reference at {:X} points to {:X}, but is not marked as object. Instead: {:?}", data_entry_offset, target, references.get_type_of(data_entry_offset)
-                );
-                writeln!(file, "\t.quad {}", self.get_symbol(target, helper)?)?;
+                match references.get_type_of(target) {
+                    None => bail!("Reference at {:X} points to {:X}, but target has no type", data_entry_offset, target),
+                    Some(DataRefType::SymbolAbsolute(addend)) => {
+                        let data = cursor.read_le::<i64>()?;
+                        ensure!(data == addend, "Reference at {:X} points to {:X} + {}, but data is {:X}", data_entry_offset, target, addend, data);
+                        let target_symbol_idx = (target - self.symbol_table.0) / std::mem::size_of::<DynamicSymbol>() as u64;
+                        let Some(name) = self.dynstr_table.get(&(self.symbol_table.1[target_symbol_idx as usize].str_table_offset as u64)) else {
+                            bail!("Symbol at index {:X} has no name", target);
+                        };
+                        writeln!(file, "\t.quad {}+{}", name, addend)?;
+                    }
+                    Some(_) => {
+                        let data = cursor.read_le::<u64>()?;
+                        ensure!(data == target, "Reference at {:X} points to {:X}, but data is {:X}", data_entry_offset, target, data);
+                        // references are either objects (by symbols), unknown (by references) or int64 (by 64-bit loads)
+                        ensure!(references.get_type_of(data_entry_offset).is_none_or(|x| matches!(x, DataRefType::Object(_) | DataRefType::Unknown | DataRefType::Int64)),
+                            "Reference at {:X} points to {:X}, but is not marked as object. Instead: {:?}", data_entry_offset, target, references.get_type_of(data_entry_offset)
+                        );
+                        writeln!(file, "\t.quad {}", self.get_symbol(target, helper)?)?;
+                    }
+                }
             } else if let Some(data_type) = references.get_type_of(data_entry_offset) {
                 match data_type {
                     DataRefType::Int8 => writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?,
