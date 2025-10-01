@@ -785,7 +785,9 @@ impl NSO {
         use std::io::Write;
         let mut file = File::create(path)?;
         writeln!(file, ".section \".rodata.module_name\"")?;
-        writeln!(file, ".quad 0")?;
+        writeln!(file, ".word 0")?;
+        writeln!(file, ".word {}", self.build_str.len())?;
+        //writeln!(file, ".quad 0")?;
         writeln!(file, ".string \"{}\"", escape_for_asm_string(&self.build_str))?;
 
         Ok(())
