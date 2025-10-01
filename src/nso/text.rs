@@ -621,7 +621,7 @@ const CRT0: &str = r#"
 .extern __nx_module_runtime
 
 __module_start:
-    b .
+    .word 0
     .word __nx_mod0 - __module_start
 
 .section ".text.mod0"
