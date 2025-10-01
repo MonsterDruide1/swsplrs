@@ -255,14 +255,16 @@ impl TextSegment {
                                 &mut reference_tracker
                             )?;
                             // for something like `add x22, x23, #20` and `x23` being an adrp target, adjust target of adrp
-                            if let Some(current_target) = current_block.adrp_targets_at_end.get(&get_operand_reg(&detail, 1)?) {
+                            // TODO: this causes X8 = ADRP:hi(target) ; X8 += lo(target) ; X8 += lo(other), which is not valid
+                            // potential fix: generate `add x8, x8, other-target` for second add
+                            /*if let Some(current_target) = current_block.adrp_targets_at_end.get(&get_operand_reg(&detail, 1)?) {
                                 new_adrp_target = Some((get_operand_reg(&detail, 0)?, AdrpInfo {
                                     target: current_target.target + offset,
                                     location: current_target.location,
                                     has_been_used: true,  // maybe it also just wants to get the pointer, in which case this target will not be used anymore
                                     is_added: true,
                                 }));
-                            }
+                            }*/
                         }
                     }
                     "ldr" | "str" | "ldrh" | "strh" | "ldrb" | "strb" | "ldrsh" => {
