@@ -24,6 +24,7 @@ pub struct NSO {
     pub hash_table: HashTable,
     pub gnu_hash_table: GnuHashTable,
     pub embed: Vec<String>,
+    pub ex_info: GotMetadata,
 }
 
 impl NSO {
@@ -104,6 +105,12 @@ impl NSO {
         // .embed
         let embed = Self::parse_embed(&rodata_segment, file.header.embed_offset, file.header.embed_size)?;
 
+        // .ex_info
+        let ex_info = GotMetadata {
+            start_offset: text.module.ex_info_start_offset as u64 + text.module.header_offset as u64,
+            count: (text.module.ex_info_end_offset - text.module.ex_info_start_offset) as u64 / 8,
+        };
+
         Ok(NSO {
             file,
             text,
@@ -119,6 +126,7 @@ impl NSO {
             hash_table,
             gnu_hash_table,
             embed,
+            ex_info,
         })
     }
 
@@ -147,6 +155,7 @@ impl NSO {
             (".dynstr", Box::new(|(_,_)| self.export_dynstr(path.join("dynstr.s")))),
             (".hash", Box::new(|(_,_)| self.export_hash(path.join("hash.s")))),
             (".gnu.hash", Box::new(|(_,_)| self.export_gnu_hash(path.join("gnu_hash.s")))),
+            (".ex_info", Box::new(|(_,_)| self.export_ex_info(path.join("ex_info.s")))),
             (".embed", Box::new(|(_,_)| self.export_embed(path.join("embed.s")))),
             (".text", Box::new(|(r,m)| self.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
             (".bss", Box::new(|(r,m)| self.export_bss(path.join("bss.s"), r, &helper, m))),
@@ -612,7 +621,7 @@ impl NSO {
         self.export_data_section(path,
             ".rodata",
             &self.file.memory,
-            self.file.header.embed_offset as u64 - self.file.header.dynstr_size as u64 - self.file.header.dynstr_offset as u64,
+            self.text.module.ex_info_start_offset as u64 + self.text.module.header_offset as u64 - self.file.header.dynstr_size as u64 - (self.file.header.dynstr_offset as u64 + self.file.header.get_segment_mem_offset(&NsoSegment::Rodata) as u64),
             self.file.header.get_segment_mem_offset(&NsoSegment::Rodata) as u64 + self.file.header.dynstr_offset as u64 + self.file.header.dynstr_size as u64,
             references, helper, m
         )
@@ -863,6 +872,23 @@ impl NSO {
         Ok(())
     }
 
+    fn export_ex_info(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \".ex_info\", \"a\"")?;
+
+        let cursor = &mut Cursor::new(&self.file.memory[
+            self.ex_info.start_offset as usize ..
+            (self.ex_info.start_offset as u64 + self.ex_info.count * 8) as usize
+        ]);
+        println!("exporting from {:X} to {:X}", self.ex_info.start_offset, self.ex_info.start_offset + self.ex_info.count as u64 * 8);
+        for _ in 0..self.ex_info.count*8 {
+            writeln!(file, ".byte 0x{:X}", cursor.read_le::<u8>()?)?;
+        }
+
+        Ok(())
+    }
+    
     fn export_embed(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
