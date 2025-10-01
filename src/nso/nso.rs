@@ -25,6 +25,7 @@ pub struct NSO {
     pub gnu_hash_table: GnuHashTable,
     pub embed: Vec<String>,
     pub ex_info: GotMetadata,
+    pub unknown_rodata: GotMetadata,
 }
 
 impl NSO {
@@ -111,6 +112,12 @@ impl NSO {
             count: (text.module.ex_info_end_offset - text.module.ex_info_start_offset) as u64 / 8,
         };
 
+        // .unknown_rodata
+        let unknown_rodata = GotMetadata {
+            start_offset: text.module.ex_info_end_offset as u64 + text.module.header_offset as u64,
+            count: (file.header.embed_offset + file.header.get_segment_mem_offset(&NsoSegment::Rodata) - text.module.ex_info_end_offset - text.module.header_offset) as u64 / 8,
+        };
+
         Ok(NSO {
             file,
             text,
@@ -127,6 +134,7 @@ impl NSO {
             gnu_hash_table,
             embed,
             ex_info,
+            unknown_rodata,
         })
     }
 
@@ -147,6 +155,7 @@ impl NSO {
             ("section_start_labels", Box::new(|(_,_)| self.export_section_start_labels(path.join("section_start_labels.s")))),
             ("crt0", Box::new(|(_,_)| self.text.export_crt0(path.join("crt0.s")))),
             ("unknown data gap", Box::new(|(_,_)| self.export_unknown_data_gap(path.join("unknown_data_gap.s")))),
+            ("unknown rodata", Box::new(|(_,_)| self.export_unknown_rodata(path.join("unknown_rodata.s")))),
             (".module_name", Box::new(|(_,_)| self.export_module_name(path.join("module_name.s")))),
             (".rela.dyn", Box::new(|(_,_)| self.export_relocations(path.join("rela.dyn.s"), ".rela.dyn", &self.reloc_dyn_table))),
             (".rela.plt", Box::new(|(_,_)| self.export_relocations(path.join("rela.plt.s"), ".rela.plt", &self.reloc_plt_table))),
@@ -881,14 +890,29 @@ impl NSO {
             self.ex_info.start_offset as usize ..
             (self.ex_info.start_offset as u64 + self.ex_info.count * 8) as usize
         ]);
-        println!("exporting from {:X} to {:X}", self.ex_info.start_offset, self.ex_info.start_offset + self.ex_info.count as u64 * 8);
         for _ in 0..self.ex_info.count*8 {
             writeln!(file, ".byte 0x{:X}", cursor.read_le::<u8>()?)?;
         }
 
         Ok(())
     }
-    
+
+    fn export_unknown_rodata(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, ".section \".unknown_rodata\", \"a\"")?;
+
+        let cursor = &mut Cursor::new(&self.file.memory[
+            self.unknown_rodata.start_offset as usize ..
+            (self.unknown_rodata.start_offset as u64 + self.unknown_rodata.count * 8) as usize
+        ]);
+        for _ in 0..self.unknown_rodata.count*8 {
+            writeln!(file, ".byte 0x{:X}", cursor.read_le::<u8>()?)?;
+        }
+
+        Ok(())
+    }
+
     fn export_embed(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
