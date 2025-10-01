@@ -530,6 +530,26 @@ impl TextSegment {
                     writeln!(file, "\t{} {}", mnemonic, instr.op_str().ok_or_else(|| anyhow::anyhow!("Failed to get operand string"))?)?;
                 }
             }
+
+            // custom re-mappings because assembler and disassembler disagree
+            "mov" => {
+                // mov x0, #imm  =>  orr x0, xzr, #imm
+                let try_map = || -> anyhow::Result<String> {
+                    let target_reg = get_operand_reg_name(&detail, 0, cs)?;
+                    let imm = get_operand_imm(&detail, 1)?;
+                    ensure!(is_valid_orr_immediate(imm), "Immediate 0x{:X} not valid for orr instruction at 0x{:X}", imm, instr.address());
+                    let zero_reg = match get_reg_type(get_operand_reg(&detail, 0)?, cs)? {
+                        DataRefType::Int32 => "wzr",
+                        DataRefType::Int64 => "xzr",
+                        _ => bail!("Unsupported register type for mov instruction at 0x{:X}", instr.address()),
+                    };
+                    Ok(format!("orr {}, {}, #0x{:X}", target_reg, zero_reg, imm))
+                };
+                let result = try_map().or_else::<anyhow::Error, _>(
+                    |_| Ok(format!("{} {}", mnemonic, instr.op_str().ok_or_else(|| anyhow::anyhow!("Failed to get operand string"))?.to_string()))
+                )?;
+                writeln!(file, "\t{}", result)?;
+            }
             _ => {
                 writeln!(file, "\t{} {}", mnemonic, instr.op_str().ok_or_else(|| anyhow::anyhow!("Failed to get operand string"))?)?;
             }
@@ -613,6 +633,54 @@ fn get_reg_type(reg: capstone::RegId, cs: &capstone::Capstone) -> anyhow::Result
         "q" => Ok(DataRefType::Float128),
         _ => bail!("Unsupported register name: {}", name),
     }
+}
+
+// FIXME: this is ChatGPT. Needs review and rewriting.
+fn is_valid_orr_immediate(imm: u64) -> bool {
+    // check if `pattern` (p bits) contains a single contiguous run of 1s
+    fn single_ones_run(mut pattern: u64, p: u32) -> bool {
+        let mask = if p == 64 { u64::MAX } else { (1u64 << p) - 1 };
+        pattern &= mask;
+        if pattern & mask == 0 {
+            return false;  // must not be all zeros
+        }
+        // skip leading zeros
+        while pattern & 1 == 0 {
+            pattern >>= 1;
+        }
+        // skip the single run of ones
+        while pattern & 1 == 1 {
+            pattern >>= 1;
+        }
+        // must be all consumed
+        pattern == 0
+    }
+    if imm == 0xFFFFFFFFFFFFFFFF || imm == 0 {
+        return false;  // all zeros or all ones is valid
+    }
+
+    for &p in &[2u32, 4, 8, 16, 32, 64] {
+        let mask = if p == 64 { u64::MAX } else { (1u64 << p) - 1 };
+        let pattern = imm & mask;
+
+        // build repeated pattern across 64 bits
+        let mut rep: u64 = 0;
+        let repeats = 64 / p;
+        for i in 0..repeats {
+            rep |= pattern << (i * p);
+        }
+
+        if rep != imm {
+            continue;
+        }
+
+        // pattern must be a single run of ones or zeros (i.e. its complement has single ones run)
+        if single_ones_run(pattern, p) || single_ones_run(!pattern & mask, p) {
+            return true;
+        }
+    }
+
+    false
 }
 
 const CRT0: &str = r#"
