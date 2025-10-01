@@ -529,10 +529,13 @@ impl TextSegment {
                 }
             }
 
-            // custom re-mappings because assembler and disassembler disagree
+            // custom re-mappings because of canonicalization
             "mov" => {
+                let bytes = instr.bytes();
                 // mov x0, #imm  =>  orr x0, xzr, #imm
                 let try_map = || -> anyhow::Result<String> {
+                    ensure!(bytes[3] & 0b01111111 == 0b00110010);  // first bit is ignored = size flag (32/64 bits)
+                    ensure!(bytes[2] & 0b10000000 == 0b00000000);
                     let target_reg = get_operand_reg_name(&detail, 0, cs)?;
                     let imm = get_operand_imm(&detail, 1)?;
                     ensure!(is_valid_orr_immediate(imm), "Immediate 0x{:X} not valid for orr instruction at 0x{:X}", imm, instr.address());
@@ -543,9 +546,11 @@ impl TextSegment {
                     };
                     Ok(format!("orr {}, {}, #0x{:X}", target_reg, zero_reg, imm))
                 };
-                let result = try_map().or_else::<anyhow::Error, _>(
-                    |_| Ok(format!("{} {}", mnemonic, instr.op_str().ok_or_else(|| anyhow::anyhow!("Failed to get operand string"))?.to_string()))
-                )?;
+                let result = if let Ok(mapped) = try_map() {
+                    mapped
+                } else {
+                    format!("{} {}", mnemonic, instr.op_str().ok_or_else(|| anyhow::anyhow!("Failed to get operand string"))?.to_string())
+                };
                 writeln!(file, "\t{}", result)?;
             }
             _ => {
