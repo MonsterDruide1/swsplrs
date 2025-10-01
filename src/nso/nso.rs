@@ -18,14 +18,14 @@ pub struct NSO {
     pub reloc_dyn_table: Vec<Relocation>,
     pub reloc_plt_table: Vec<Relocation>,
     pub dynstr_table: BTreeMap<u64, String>,
-    pub got_plt_metadata: GotMetadata,
-    pub got_metadata: GotMetadata,
+    pub got_plt_metadata: RawSectionMetadata,
+    pub got_metadata: RawSectionMetadata,
     pub init_array: (u64, Vec<u64>),  // offset + entries
     pub hash_table: HashTable,
     pub gnu_hash_table: GnuHashTable,
     pub embed: Vec<String>,
-    pub ex_info: GotMetadata,
-    pub unknown_rodata: GotMetadata,
+    pub ex_info: RawSectionMetadata,
+    pub unknown_rodata: RawSectionMetadata,
 }
 
 impl NSO {
@@ -81,18 +81,18 @@ impl NSO {
         let dynstr_table = Self::parse_dynamic_string_table(&rodata_segment, file.header.dynstr_offset, file.header.dynstr_size)?;
         
         // .got.plt
-        let got_plt_metadata = GotMetadata {
+        let got_plt_metadata = RawSectionMetadata {
             start_offset: Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_PLTGOT)? as u64,
-            count: reloc_plt_table.iter().filter(|r| r.reloc_type == RelocationType::R_AARCH64_JUMP_SLOT).count() as u64,
+            size: reloc_plt_table.iter().filter(|r| r.reloc_type == RelocationType::R_AARCH64_JUMP_SLOT).count() as u64 * 8,
         };
         // actually +0x18, but we handle that in export
         // TODO: cleanup
 
         // .got
-        let got_start_offset = got_plt_metadata.start_offset + got_plt_metadata.count*0x8+0x18;  // 0x18 for three 0 entries at the start
-        let got_metadata = GotMetadata {
+        let got_start_offset = got_plt_metadata.start_offset + got_plt_metadata.size+0x18;  // 0x18 for three 0 entries at the start
+        let got_metadata = RawSectionMetadata {
             start_offset: got_start_offset,
-            count: (Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_INIT_ARRAY)? - got_start_offset) / 8,
+            size: Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_INIT_ARRAY)? - got_start_offset,
         };
 
         // .init_array
@@ -107,15 +107,15 @@ impl NSO {
         let embed = Self::parse_embed(&rodata_segment, file.header.embed_offset, file.header.embed_size)?;
 
         // .ex_info
-        let ex_info = GotMetadata {
+        let ex_info = RawSectionMetadata {
             start_offset: text.module.ex_info_start_offset as u64 + text.module.header_offset as u64,
-            count: (text.module.ex_info_end_offset - text.module.ex_info_start_offset) as u64 / 8,
+            size: (text.module.ex_info_end_offset - text.module.ex_info_start_offset) as u64,
         };
 
         // .unknown_rodata
-        let unknown_rodata = GotMetadata {
+        let unknown_rodata = RawSectionMetadata {
             start_offset: text.module.ex_info_end_offset as u64 + text.module.header_offset as u64,
-            count: (file.header.embed_offset + file.header.get_segment_mem_offset(&NsoSegment::Rodata) - text.module.ex_info_end_offset - text.module.header_offset) as u64 / 8,
+            size: (file.header.embed_offset + file.header.get_segment_mem_offset(&NsoSegment::Rodata) - text.module.ex_info_end_offset - text.module.header_offset) as u64,
         };
 
         Ok(NSO {
@@ -508,7 +508,7 @@ impl NSO {
             got_plt_mem_offset += 8;
         }
 
-        for i in 0..self.got_plt_metadata.count {
+        for i in 0..self.got_plt_metadata.size/8 {
             let entry = &self.reloc_plt_table[i as usize];
             let sym = &self.symbol_table.1[entry.sym_idx as usize];
             let name = &self.dynstr_table[&(sym.str_table_offset as u64)];
@@ -528,7 +528,7 @@ impl NSO {
         writeln!(file, ".section \".got\"")?;
         writeln!(file, "")?;
 
-        for i in 0..self.got_metadata.count {
+        for i in 0..self.got_metadata.size/8 {
             let got_entry_offset = self.got_metadata.start_offset + i * 8;
             writeln!(file, ".global off_{:X}", got_entry_offset)?;
             writeln!(file, "off_{:X}:", got_entry_offset)?;
@@ -888,9 +888,9 @@ impl NSO {
 
         let cursor = &mut Cursor::new(&self.file.memory[
             self.ex_info.start_offset as usize ..
-            (self.ex_info.start_offset as u64 + self.ex_info.count * 8) as usize
+            (self.ex_info.start_offset as u64 + self.ex_info.size) as usize
         ]);
-        for _ in 0..self.ex_info.count*8 {
+        for _ in 0..self.ex_info.size {
             writeln!(file, ".byte 0x{:X}", cursor.read_le::<u8>()?)?;
         }
 
@@ -904,9 +904,9 @@ impl NSO {
 
         let cursor = &mut Cursor::new(&self.file.memory[
             self.unknown_rodata.start_offset as usize ..
-            (self.unknown_rodata.start_offset as u64 + self.unknown_rodata.count * 8) as usize
+            (self.unknown_rodata.start_offset as u64 + self.unknown_rodata.size) as usize
         ]);
-        for _ in 0..self.unknown_rodata.count*8 {
+        for _ in 0..self.unknown_rodata.size {
             writeln!(file, ".byte 0x{:X}", cursor.read_le::<u8>()?)?;
         }
 
@@ -1106,9 +1106,9 @@ pub struct GnuHashTable {
 }
 
 #[derive(Debug)]
-pub struct GotMetadata {
+pub struct RawSectionMetadata {
     pub start_offset: u64,
-    pub count: u64,
+    pub size: u64,
 }
 
 
