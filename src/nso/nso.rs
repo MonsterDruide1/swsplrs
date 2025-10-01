@@ -577,8 +577,7 @@ impl NSO {
                 .with_style(ProgressStyle::with_template("{prefix} {wide_bar} {binary_bytes}/{binary_total_bytes}  ").unwrap())
         );
 
-        // TODO: figure out where +8 comes from
-        for i in 0..(bss_size+8) {
+        for i in 0..bss_size {
             pb.as_ref().map(|p| p.inc(1));
 
             let bss_entry_offset = self.text.module.bss_start as u64 + self.text.module.header_offset as u64 + i;
