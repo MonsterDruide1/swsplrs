@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, HashMap, HashSet}, fs::{self, File}, io::Cursor, path::Path, process::Command};
+use std::{collections::{BTreeMap, HashMap, HashSet}, fs::{self, File}, io::{Cursor, Seek}, path::Path, process::Command};
 
 use anyhow::{bail, ensure, Result};
 use binrw::{binread, BinRead, BinReaderExt, NullString};
@@ -675,8 +675,24 @@ impl NSO {
                     DataRefType::Int16 => writeln!(file, "\t.short 0x{:04X}", cursor.read_le::<u16>()?)?,
                     DataRefType::Int32 => writeln!(file, "\t.word 0x{:08X}", cursor.read_le::<u32>()?)?,
                     DataRefType::Int64 => writeln!(file, "\t.quad 0x{:016X}", cursor.read_le::<u64>()?)?,
-                    DataRefType::Float32 => writeln!(file, "\t.float {}", cursor.read_le::<f32>()?)?,
-                    DataRefType::Float64 => writeln!(file, "\t.double {}", cursor.read_le::<f64>()?)?,
+                    DataRefType::Float32 => {
+                        let val = cursor.read_le::<f32>()?;
+                        if !val.is_finite() {
+                            cursor.seek_relative(-4)?; // go back to re-read the bytes
+                            writeln!(file, "\t.word {}  // float: {}", cursor.read_le::<u32>()?, val)?;
+                        } else {
+                            writeln!(file, "\t.float {}", val)?;
+                        }
+                    }
+                    DataRefType::Float64 => {
+                        let val = cursor.read_le::<f64>()?;
+                        if !val.is_finite() {
+                            cursor.seek_relative(-8)?; // go back to re-read the bytes
+                            writeln!(file, "\t.quad {}  // double: {}", cursor.read_le::<u64>()?, val)?;
+                        } else {
+                            writeln!(file, "\t.double {}", val)?;
+                        }
+                    }
                     DataRefType::Float128 => {
                         for _ in 0..16 {
                             writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?;
@@ -696,7 +712,7 @@ impl NSO {
                 for skipped_off in (cursor_pos+1)..cursor.position() {
                     let skipped_data_entry_offset = offset + skipped_off;
                     if let Some(skipped_data_type) = references.get_type_of(skipped_data_entry_offset) {
-                        bail!("Missed reference to {:X} of type {:?} in {}.", skipped_data_entry_offset, skipped_data_type, name);
+                        bail!("Missed reference to {:X} of type {:?} in {} - currently at {:X}", skipped_data_entry_offset, skipped_data_type, name, cursor.position()+offset);
                     }
                 }
             }
