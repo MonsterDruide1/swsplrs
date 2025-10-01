@@ -632,6 +632,6 @@ __nx_mod0:
     .word  __bss_start__        - __nx_mod0
     .word  __bss_end__          - __nx_mod0
     .word  __embed_start__      - __nx_mod0
-    .word  __embed_end__ - __embed_start__
+    .word  __embed_size__
     .word  __nx_module_runtime  - __nx_mod0
 "#;
