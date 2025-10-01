@@ -778,7 +778,9 @@ impl NSO {
     fn export_relocations(&self, path: impl AsRef<Path>, name: &str, table: &Vec<Relocation>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
-        writeln!(file, ".section \"{}\"", name)?;
+        // FIXME: causes warning about relocation type being of unexpected type (allocatable).
+        // fix by turning into "proper" relocation section with actual relocation entries.
+        writeln!(file, ".section \"{}\", \"a\"", name)?;
         writeln!(file, "")?;
     
         for relocation in table.iter() {
