@@ -23,7 +23,7 @@ pub struct NSO {
     pub init_array: (u64, Vec<u64>),  // offset + entries
     pub hash_table: HashTable,
     pub gnu_hash_table: GnuHashTable,
-    pub embed: Vec<String>,
+    pub embed: Vec<(u64, String)>,  // offset + content
     pub ex_info: RawSectionMetadata,
     pub unknown_rodata: RawSectionMetadata,
 }
@@ -104,7 +104,7 @@ impl NSO {
         )?;
 
         // .embed
-        let embed = Self::parse_embed(&rodata_segment, file.header.embed_offset, file.header.embed_size)?;
+        let embed = Self::parse_embed(&file.memory, file.header.embed_offset + file.header.get_segment_mem_offset(&NsoSegment::Rodata), file.header.embed_size)?;
 
         // .ex_info
         let ex_info = RawSectionMetadata {
@@ -165,7 +165,7 @@ impl NSO {
             (".hash", Box::new(|(_,_)| self.export_hash(path.join("hash.s")))),
             (".gnu.hash", Box::new(|(_,_)| self.export_gnu_hash(path.join("gnu_hash.s")))),
             (".ex_info", Box::new(|(_,_)| self.export_ex_info(path.join("ex_info.s")))),
-            (".embed", Box::new(|(_,_)| self.export_embed(path.join("embed.s")))),
+            (".embed", Box::new(|(_,_)| self.export_embed(path.join("embed.s"), &helper))),
             (".text", Box::new(|(r,m)| self.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
             (".bss", Box::new(|(r,m)| self.export_bss(path.join("bss.s"), r, &helper, m))),
             (".data", Box::new(|(r,m)| self.export_data(path.join("data.s"), r, &helper, m))),
@@ -402,12 +402,12 @@ impl NSO {
         })
     }
 
-    fn parse_embed(rodata_segment: &[u8], embed_offset: u32, embed_size: u32) -> anyhow::Result<Vec<String>> {
-        let embed_data = &rodata_segment[embed_offset as usize .. (embed_offset + embed_size) as usize];
+    fn parse_embed(memory: &[u8], embed_offset: u32, embed_size: u32) -> anyhow::Result<Vec<(u64, String)>> {
+        let embed_data = &memory[embed_offset as usize .. (embed_offset + embed_size) as usize];
         let mut cursor = Cursor::new(embed_data);
         let mut strings = Vec::new();
         while (cursor.position() as usize) < embed_data.len() {
-            strings.push(cursor.read_le::<NullString>()?.to_string());
+            strings.push((cursor.position() + embed_offset as u64, cursor.read_le::<NullString>()?.to_string()));
         }
         Ok(strings)
     }
@@ -915,13 +915,15 @@ impl NSO {
         Ok(())
     }
 
-    fn export_embed(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+    fn export_embed(&self, path: impl AsRef<Path>, helper: &NsoLookupHelper) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
         writeln!(file, ".section \".embed\", \"a\"")?;
 
-        for value in self.embed.iter() {
-            writeln!(file, ".string \"{}\"", escape_for_asm_string(value))?;
+        for (offset, value) in self.embed.iter() {
+            writeln!(file, ".global {}", self.get_symbol(*offset, helper)?)?;
+            writeln!(file, "{}:", self.get_symbol(*offset, helper)?)?;
+            writeln!(file, "\t.string \"{}\"", escape_for_asm_string(value))?;
         }
 
         Ok(())
