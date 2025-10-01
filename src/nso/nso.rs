@@ -516,7 +516,10 @@ impl NSO {
             let name = &self.dynstr_table[&(sym.str_table_offset as u64)];
             writeln!(file, ".global off_{:X}", got_plt_mem_offset)?;
             writeln!(file, "off_{:X}:", got_plt_mem_offset)?;
-            writeln!(file, "\t.quad {}", name)?;
+            // FIXME: properly generate .got.plt (-pie, -shared, mark functions as `.type func, %function`, etc)
+            //writeln!(file, "\t.quad {}", name)?;
+            writeln!(file, "\t.quad {}", 0x0000000000bef028)?;  // FIXME: temporary hack, specific to SMO
+
             writeln!(file, "")?;
             got_plt_mem_offset += 8;
         }
@@ -535,7 +538,11 @@ impl NSO {
             writeln!(file, ".global off_{:X}", got_entry_offset)?;
             writeln!(file, "off_{:X}:", got_entry_offset)?;
 
-            let Some(entry_index) = helper.reloc_dyn_addr_to_idx.get(&got_entry_offset) else {
+            // FIXME: generate this section properly in linker instead of hardcoding
+            let mut cursor = Cursor::new(&self.file.memory[(got_entry_offset as usize) .. (got_entry_offset as usize + 8)]);
+            let value: u64 = cursor.read_le()?;
+            writeln!(file, "\t.quad {}", value)?;
+            /*let Some(entry_index) = helper.reloc_dyn_addr_to_idx.get(&got_entry_offset) else {
                 if i == 0 {
                     // FIXME: actually handle this first one properly
                     writeln!(file, "\t.quad 0")?;
@@ -557,7 +564,7 @@ impl NSO {
                     writeln!(file, "\t.quad {}", self.get_symbol(entry.addend as u64, helper)?)?;
                 }
                 _ => bail!("Unsupported relocation type {:?} in .got", entry.reloc_type),
-            }
+            }*/
             writeln!(file, "")?;
         }
 
