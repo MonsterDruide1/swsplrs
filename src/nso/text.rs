@@ -527,7 +527,7 @@ impl TextSegment {
                     //println!("Reference found for memory operand at 0x{:X} to 0x{:X}", instr.address(), target);
                     writeln!(file, "\t{} {}, [{}, :lo12:{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, parent.get_symbol(target, helper)?)?;
                 } else {
-                    writeln!(file, "\t{} {}, [{}, #{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, get_operand_mem(&detail, 1)?.disp())?;
+                    writeln!(file, "\t{} {}", mnemonic, instr.op_str().ok_or_else(|| anyhow::anyhow!("Failed to get operand string"))?)?;
                 }
             }
             _ => {
