@@ -511,12 +511,8 @@ impl TextSegment {
             }
             "add" => {
                 // we are only interested in adds with last operand being an immediate (=> offset)
-                if let Ok(_) = get_operand_imm(&detail, 2) {
-                    if let Ok(target) = reference_target {
-                        writeln!(file, "\t{} {}, {}, :lo12:{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, parent.get_symbol(target, helper)?)?;
-                    } else {
-                        writeln!(file, "\t{} {}, {}, #{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, get_operand_imm(&detail, 2)?)?;
-                    }
+                if let Ok(_) = get_operand_imm(&detail, 2) && let Ok(target) = reference_target {
+                    writeln!(file, "\t{} {}, {}, :lo12:{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, parent.get_symbol(target, helper)?)?;
                 } else {
                     writeln!(file, "\t{} {}", mnemonic, instr.op_str().ok_or_else(|| anyhow::anyhow!("Failed to get operand string"))?)?;
                 }
