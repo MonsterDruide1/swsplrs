@@ -66,11 +66,7 @@ impl NSO {
         // TODO: cleanup
 
         // .text
-        let text_section = text_segment[text_section_offset..].to_vec();
-        let text = TextSection {
-            section: text_section,
-            section_offset: text_section_offset,
-        };
+        let text = TextSection::from_data(&text_segment, text_section_offset, &got_plt_metadata)?;
 
         // .buildstr
         let build_str = Self::parse_buildstr(&mut rodata)?;
@@ -178,6 +174,7 @@ impl NSO {
             (".gnu.hash", Box::new(|(_,_)| self.export_gnu_hash(path.join("gnu_hash.s")))),
             (".ex_info", Box::new(|(_,_)| self.export_ex_info(path.join("ex_info.s")))),
             (".embed", Box::new(|(_,_)| self.export_embed(path.join("embed.s"), &helper))),
+            (".plt", Box::new(|(_,_)| self.text.export_plt(path.join("plt.s"), &self.got_plt_metadata, &helper, &self))),
             (".text", Box::new(|(r,m)| self.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
             (".bss", Box::new(|(r,m)| self.export_bss(path.join("bss.s"), r, &helper, m))),
             (".data", Box::new(|(r,m)| self.export_data(path.join("data.s"), r, &helper, m))),

@@ -5,15 +5,132 @@ use capstone::{self, arch::{arm64::{Arm64Operand, Arm64OperandType, Arm64Reg}, A
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rangemap::RangeMap;
 
-use crate::{file_list::Object, nso::nso::{NsoLookupHelper, NSO}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}};
+use crate::{file_list::Object, nso::nso::{NsoLookupHelper, RawSectionMetadata, NSO}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}};
 
 pub struct TextSection {
     pub section: Vec<u8>,
     pub section_offset: usize,  // offset of section within text segment
+    pub plt_functions: HashSet<u64>,  // addresses of functions in the .plt section
 }
 impl TextSection {
+    pub fn from_data(data: &[u8], offset: usize, got_plt_metadata: &RawSectionMetadata) -> Result<Self> {
+        let cs = construct_capstone()?;
+
+        let mut plt_functions = HashSet::new();
+
+        // iterate from end, looking for .plt-function groups:
+        //  ADRP X16, #some-.got.plt@PAGE
+        //  LDR X17, [X16, #some-.got.plt@PAGEOFF]
+        //  ADD X16, X16, #some-.got.plt@PAGEOFF
+        //  BR X17
+        let mut current_offset = data.len()-(4*4);
+        let mut plt_targets = Vec::new();
+        loop {
+            let instrs = cs.disasm_count(&data[current_offset..], current_offset as u64, 4)?;
+            let try_get_plt_target = || {
+                let adrp = instrs.get(0).ok_or_else(|| anyhow::anyhow!("Failed to get ADRP instruction at 0x{:X}", current_offset))?;
+                ensure!(adrp.mnemonic().unwrap_or("") == "adrp", "Expected ADRP instruction at 0x{:X}, got {}", adrp.address(), adrp.mnemonic().unwrap_or("UNKNOWN"));
+                ensure!(get_operand_reg(&cs.insn_detail(adrp)?, 0)?.0 == Arm64Reg::ARM64_REG_X16 as u16, "Expected ADRP to use X16");
+                let adrp_target = get_operand_imm(&cs.insn_detail(adrp)?, 1)?;
+
+                let ldr = instrs.get(1).ok_or_else(|| anyhow::anyhow!("Failed to get LDR instruction at 0x{:X}", current_offset+4))?;
+                ensure!(ldr.mnemonic().unwrap_or("") == "ldr", "Expected LDR instruction at 0x{:X}, got {}", ldr.address(), ldr.mnemonic().unwrap_or("UNKNOWN"));
+                ensure!(get_operand_reg(&cs.insn_detail(ldr)?, 0)?.0 == Arm64Reg::ARM64_REG_X17 as u16, "Expected LDR to load into X17");
+                ensure!(get_operand_mem(&cs.insn_detail(ldr)?, 1)?.base().0 == Arm64Reg::ARM64_REG_X16 as u16, "Expected LDR to load from [X16]");
+                let ldr_offset = get_operand_mem(&cs.insn_detail(ldr)?, 1)?.disp() as i64;
+
+                let add = instrs.get(2).ok_or_else(|| anyhow::anyhow!("Failed to get ADD instruction at 0x{:X}", current_offset+8))?;
+                ensure!(add.mnemonic().unwrap_or("") == "add", "Expected ADD instruction at 0x{:X}, got {}", add.address(), add.mnemonic().unwrap_or("UNKNOWN"));
+                ensure!(get_operand_reg(&cs.insn_detail(add)?, 0)?.0 == Arm64Reg::ARM64_REG_X16 as u16, "Expected ADD to write to X16");
+                ensure!(get_operand_reg(&cs.insn_detail(add)?, 1)?.0 == Arm64Reg::ARM64_REG_X16 as u16, "Expected ADD to read from X16");
+                ensure!(get_operand_imm(&cs.insn_detail(add)?, 2)? == ldr_offset as u64, "Expected ADD to add same offset as LDR");
+
+                let br = instrs.get(3).ok_or_else(|| anyhow::anyhow!("Failed to get BR instruction at 0x{:X}", current_offset+12))?;
+                ensure!(br.mnemonic().unwrap_or("") == "br", "Expected BR instruction at 0x{:X}, got {}", br.address(), br.mnemonic().unwrap_or("UNKNOWN"));
+                ensure!(get_operand_reg(&cs.insn_detail(br)?, 0)?.0 == Arm64Reg::ARM64_REG_X17 as u16, "Expected BR to branch to X17");
+
+                Ok((adrp_target as i64 + ldr_offset) as u64)
+            };
+
+            let Ok(target) = try_get_plt_target() else {
+                break;
+            };
+
+            plt_targets.push(target);
+            plt_functions.insert(current_offset as u64);
+            current_offset -= 4*4;
+        }
+
+        plt_targets.reverse();
+        for i in 3..got_plt_metadata.size/8 {
+            ensure!(plt_targets.get((i-3) as usize) == Some(&(got_plt_metadata.start_offset + i*8)), "PLT target at index {} does not match expected .got.plt entry at 0x{:X}", i-3, got_plt_metadata.start_offset + i*8);
+        }
+
+        // block before is still .plt:
+        //  STP X16, X30, [SP, #-0x10]!
+        //  ADRP X16, #some-.got.plt@PAGE
+        //  LDR X17, [X16, #some-.got.plt@PAGEOFF]
+        //  ADD X16, X16, #some-.got.plt@PAGEOFF
+        //  BR X17
+        //  NOP
+        //  NOP
+        //  NOP
+
+        {
+            current_offset -= 4*4;  // 4 already seeked for last plt entry, move another 4 back to look at 8 instructions
+            let instrs = cs.disasm_count(&data[current_offset..], current_offset as u64, 8)?;
+            
+            let stp = instrs.get(0).ok_or_else(|| anyhow::anyhow!("Failed to get STP instruction at 0x{:X}", current_offset))?;
+            ensure!(stp.mnemonic().unwrap_or("") == "stp", "Expected STP instruction at 0x{:X}, got {}", stp.address(), stp.mnemonic().unwrap_or("UNKNOWN"));
+            ensure!(get_operand_reg(&cs.insn_detail(stp)?, 0)?.0 == Arm64Reg::ARM64_REG_X16 as u16, "Expected STP to store X16");
+            ensure!(get_operand_reg(&cs.insn_detail(stp)?, 1)?.0 == Arm64Reg::ARM64_REG_X30 as u16, "Expected STP to store X30");
+            ensure!(get_operand_mem(&cs.insn_detail(stp)?, 2)?.base().0 == Arm64Reg::ARM64_REG_SP as u16, "Expected STP to store to [SP]");
+            ensure!(get_operand_mem(&cs.insn_detail(stp)?, 2)?.disp() == -0x10, "Expected STP to store to [SP, #-0x10]");
+
+            let adrp = instrs.get(1).ok_or_else(|| anyhow::anyhow!("Failed to get ADRP instruction at 0x{:X}", current_offset+4))?;
+            ensure!(adrp.mnemonic().unwrap_or("") == "adrp", "Expected ADRP instruction at 0x{:X}, got {}", adrp.address(), adrp.mnemonic().unwrap_or("UNKNOWN"));
+            ensure!(get_operand_reg(&cs.insn_detail(adrp)?, 0)?.0 == Arm64Reg::ARM64_REG_X16 as u16, "Expected ADRP to use X16");
+            let adrp_target = get_operand_imm(&cs.insn_detail(adrp)?, 1)?;
+
+            let ldr = instrs.get(2).ok_or_else(|| anyhow::anyhow!("Failed to get LDR instruction at 0x{:X}", current_offset+8))?;
+            ensure!(ldr.mnemonic().unwrap_or("") == "ldr", "Expected LDR instruction at 0x{:X}, got {}", ldr.address(), ldr.mnemonic().unwrap_or("UNKNOWN"));
+            ensure!(get_operand_reg(&cs.insn_detail(ldr)?, 0)?.0 == Arm64Reg::ARM64_REG_X17 as u16, "Expected LDR to load into X17");
+            ensure!(get_operand_mem(&cs.insn_detail(ldr)?, 1)?.base().0 == Arm64Reg::ARM64_REG_X16 as u16, "Expected LDR to load from [X16]");
+            let ldr_offset = get_operand_mem(&cs.insn_detail(ldr)?, 1)?.disp() as i64;
+
+            let add = instrs.get(3).ok_or_else(|| anyhow::anyhow!("Failed to get ADD instruction at 0x{:X}", current_offset+12))?;
+            ensure!(add.mnemonic().unwrap_or("") == "add", "Expected ADD instruction at 0x{:X}, got {}", add.address(), add.mnemonic().unwrap_or("UNKNOWN"));
+            ensure!(get_operand_reg(&cs.insn_detail(add)?, 0)?.0 == Arm64Reg::ARM64_REG_X16 as u16, "Expected ADD to write to X16");
+            ensure!(get_operand_reg(&cs.insn_detail(add)?, 1)?.0 == Arm64Reg::ARM64_REG_X16 as u16, "Expected ADD to read from X16");
+            ensure!(get_operand_imm(&cs.insn_detail(add)?, 2)? == ldr_offset as u64, "Expected ADD to add same offset as LDR");
+
+            let br = instrs.get(4).ok_or_else(|| anyhow::anyhow!("Failed to get BR instruction at 0x{:X}", current_offset+16))?;
+            ensure!(br.mnemonic().unwrap_or("") == "br", "Expected BR instruction at 0x{:X}, got {}", br.address(), br.mnemonic().unwrap_or("UNKNOWN"));
+            ensure!(get_operand_reg(&cs.insn_detail(br)?, 0)?.0 == Arm64Reg::ARM64_REG_X17 as u16, "Expected BR to branch to X17");
+
+            let nop1 = instrs.get(5).ok_or_else(|| anyhow::anyhow!("Failed to get first NOP instruction at 0x{:X}", current_offset+20))?;
+            ensure!(nop1.mnemonic().unwrap_or("") == "nop", "Expected first NOP instruction at 0x{:X}, got {}", nop1.address(), nop1.mnemonic().unwrap_or("UNKNOWN"));
+            let nop2 = instrs.get(6).ok_or_else(|| anyhow::anyhow!("Failed to get second NOP instruction at 0x{:X}", current_offset+24))?;
+            ensure!(nop2.mnemonic().unwrap_or("") == "nop", "Expected second NOP instruction at 0x{:X}, got {}", nop2.address(), nop2.mnemonic().unwrap_or("UNKNOWN"));
+            let nop3 = instrs.get(7).ok_or_else(|| anyhow::anyhow!("Failed to get third NOP instruction at 0x{:X}", current_offset+28))?;
+            ensure!(nop3.mnemonic().unwrap_or("") == "nop", "Expected third NOP instruction at 0x{:X}, got {}", nop3.address(), nop3.mnemonic().unwrap_or("UNKNOWN"));
+
+            let plt_target = (adrp_target as i64 + ldr_offset) as u64;
+            ensure!(plt_target == got_plt_metadata.start_offset + 2*8, "ADRP in pre-PLT block does not point to expected .got.plt entry! Expected 0x{:X}, got 0x{:X}", got_plt_metadata.start_offset + 2*8, plt_target);
+        }
+        plt_functions.insert(current_offset as u64);
+
+        Ok(Self {
+            section: data[offset..current_offset].to_vec(),
+            section_offset: offset,
+            plt_functions,
+        })
+    }
+
     // TODO: automatically analyze function boundaries to avoid `function_starts` and allow symbol-less binaries
     pub fn collect_references(&self, function_starts: &HashSet<u64>, mut reference_tracker: &mut ReferenceTracker, mpb: &Option<MultiProgress>) -> anyhow::Result<()> {
+        let function_starts = function_starts.into_iter().chain(self.plt_functions.iter()).copied().collect::<HashSet<u64>>();
+        
         let cs = construct_capstone()?;
 
         #[derive(Debug, Clone)]
@@ -361,7 +478,7 @@ impl TextSection {
                             continue;
                         }
                         //println!("Propagating adrp from 0x{:X} to 0x{:X}", range.start, next);
-                        found |= propagate_recursive(*next, *reg, adrp, &blocks, &mut reference_tracker, &mut visited_blocks, function_starts)?;
+                        found |= propagate_recursive(*next, *reg, adrp, &blocks, &mut reference_tracker, &mut visited_blocks, &function_starts)?;
                     }
                     ensure!(found, "ADRP target at 0x{:X} in register {:?} in block 0x{:X}-0x{:X} could not be propagated to any reference", adrp.target, reg, range.start, range.end);
                     visited_blocks.clear();
@@ -374,6 +491,45 @@ impl TextSection {
             }
         }
         // TODO: repeat check in other direction? Double-verify references by going backwards and checking that ref can always be resolved
+
+        Ok(())
+    }
+
+    pub fn export_plt(&self, path: impl AsRef<Path>, got_plt_metadata: &RawSectionMetadata, helper: &NsoLookupHelper, parent: &NSO) -> Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        
+        writeln!(file, ".section \".plt\"")?;
+
+        let mut current_offset = self.section_offset as u64 + self.section.len() as u64;
+        let mut current_target = got_plt_metadata.start_offset + 0x10;
+
+        writeln!(file, ".global {}", parent.get_symbol(current_offset, helper)?)?;
+        writeln!(file, "{}:", parent.get_symbol(current_offset, helper)?)?;
+        writeln!(file, "\tstp x16, x30, [sp, #-0x10]!")?;
+        writeln!(file, "\tadrp x16, {}", parent.get_symbol(current_target, helper)?)?;
+        writeln!(file, "\tldr x17, [x16, :lo12:{}]", parent.get_symbol(current_target, helper)?)?;
+        writeln!(file, "\tadd x16, x16, :lo12:{}", parent.get_symbol(current_target, helper)?)?;
+        writeln!(file, "\tbr x17")?;
+        writeln!(file, "\tnop")?;
+        writeln!(file, "\tnop")?;
+        writeln!(file, "\tnop")?;
+        
+        current_offset += 4*8;
+        current_target += 8;
+
+        for i in 0..got_plt_metadata.size/8 {
+            writeln!(file)?;
+            writeln!(file, ".global {}", parent.get_symbol(current_offset, helper)?)?;
+            writeln!(file, "{}:", parent.get_symbol(current_offset, helper)?)?;
+            writeln!(file, "\tadrp x16, {}", parent.get_symbol(current_target, helper)?)?;
+            writeln!(file, "\tldr x17, [x16, :lo12:{}]", parent.get_symbol(current_target, helper)?)?;
+            writeln!(file, "\tadd x16, x16, :lo12:{}", parent.get_symbol(current_target, helper)?)?;
+            writeln!(file, "\tbr x17")?;
+
+            current_offset += 4*4;
+            current_target += 8;
+        }
 
         Ok(())
     }
