@@ -30,12 +30,12 @@ pub struct NSO {
 
 impl NSO {
     pub fn new(file: NsoFile) -> anyhow::Result<Self> {
-        let text_segment = &file.memory[(file.header.get_segment_mem_offset(&NsoSegment::Text) as usize) ..
-            (file.header.get_segment_mem_offset(&NsoSegment::Text) + file.header.get_segment_mem_size(&NsoSegment::Text)) as usize];
-        let rodata_segment = &file.memory[(file.header.get_segment_mem_offset(&NsoSegment::Rodata) as usize) ..
-            (file.header.get_segment_mem_offset(&NsoSegment::Rodata) + file.header.get_segment_mem_size(&NsoSegment::Rodata)) as usize];
-        let data_segment = &file.memory[(file.header.get_segment_mem_offset(&NsoSegment::Data) as usize) ..
-            (file.header.get_segment_mem_offset(&NsoSegment::Data) + file.header.get_segment_mem_size(&NsoSegment::Data)) as usize];
+        let text_off = file.header.get_segment_mem_offset(&NsoSegment::Text);
+        let rodata_off = file.header.get_segment_mem_offset(&NsoSegment::Rodata);
+        let data_off = file.header.get_segment_mem_offset(&NsoSegment::Data);
+        let text_segment = &file.memory[text_off as usize..(text_off + file.header.get_segment_mem_size(&NsoSegment::Text)) as usize];
+        let rodata_segment = &file.memory[rodata_off as usize..(rodata_off + file.header.get_segment_mem_size(&NsoSegment::Rodata)) as usize];
+        let data_segment = &file.memory[data_off as usize..(data_off + file.header.get_segment_mem_size(&NsoSegment::Data)) as usize];
 
         let text = TextSegment::new(text_segment);
         let mut rodata = Cursor::new(rodata_segment);
@@ -45,13 +45,11 @@ impl NSO {
         let build_str = Self::parse_buildstr(&mut rodata)?;
 
         // .dynsym
-        let symbol_table = Self::parse_dynamic_symbols(&file.memory, file.header.dynsym_offset + file.header.get_segment_mem_offset(&NsoSegment::Rodata), file.header.dynsym_size)?;
+        let symbol_table = Self::parse_dynamic_symbols(&file.memory, file.header.dynsym_offset + rodata_off, file.header.dynsym_size)?;
 
         // .dynamic
-        let dynamic_offset = (text.module.header_offset + text.module.dyn_offset - file.header.get_segment_mem_offset(&NsoSegment::Data)) as usize;
-        let dynamic_segment = Self::parse_dynamic_section(
-            &data_segment[dynamic_offset..]
-        )?;
+        let dynamic_offset = (text.module.header_offset + text.module.dyn_offset) as usize;
+        let dynamic_segment = Self::parse_dynamic_section(&file.memory[dynamic_offset..])?;
 
         // .hash
         let hash_table = Self::parse_hash_table(
@@ -104,7 +102,7 @@ impl NSO {
         )?;
 
         // .embed
-        let embed = Self::parse_embed(&file.memory, file.header.embed_offset + file.header.get_segment_mem_offset(&NsoSegment::Rodata), file.header.embed_size)?;
+        let embed = Self::parse_embed(&file.memory, file.header.embed_offset + rodata_off, file.header.embed_size)?;
 
         // .ex_info
         let ex_info = RawSectionMetadata {
@@ -115,7 +113,7 @@ impl NSO {
         // .unknown_rodata
         let unknown_rodata = RawSectionMetadata {
             start_offset: text.module.ex_info_end_offset as u64 + text.module.header_offset as u64,
-            size: (file.header.embed_offset + file.header.get_segment_mem_offset(&NsoSegment::Rodata) - text.module.ex_info_end_offset - text.module.header_offset) as u64,
+            size: (file.header.embed_offset + rodata_off - text.module.ex_info_end_offset - text.module.header_offset) as u64,
         };
 
         Ok(NSO {
