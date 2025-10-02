@@ -1,29 +1,17 @@
-use std::{collections::{HashMap, HashSet}, fs::File, io::Cursor, path::Path, u64};
+use std::{collections::{HashMap, HashSet}, fs::File, path::Path, u64};
 
 use anyhow::{bail, ensure, Result};
-use binrw::{binread, BinRead};
 use capstone::{self, arch::{arm64::{Arm64Operand, Arm64OperandType, Arm64Reg}, ArchOperand, BuildsCapstone, BuildsCapstoneEndian}, Capstone, Insn, InsnGroupId, RegId};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rangemap::RangeMap;
 
 use crate::{file_list::Object, nso::nso::{NsoLookupHelper, NSO}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}};
 
-pub struct TextSegment {
-    pub module: Module,
+pub struct TextSection {
     pub section: Vec<u8>,
     pub section_offset: usize,  // offset of section within text segment
 }
-impl TextSegment {
-    pub fn new(text: &[u8]) -> Self {
-        let mut cursor = Cursor::new(text);
-        let module = Module::read_le(&mut cursor).unwrap();
-        // TODO: potentially read all 0-bytes until *actual* start of section
-        let section_offset = cursor.position() as usize;
-        let section = text[section_offset..].to_vec();
-
-        Self { module, section, section_offset }
-    }
-
+impl TextSection {
     // TODO: automatically analyze function boundaries to avoid `function_starts` and allow symbol-less binaries
     pub fn collect_references(&self, function_starts: &HashSet<u64>, mut reference_tracker: &mut ReferenceTracker, mpb: &Option<MultiProgress>) -> anyhow::Result<()> {
         let cs = construct_capstone()?;
@@ -390,13 +378,6 @@ impl TextSegment {
         Ok(())
     }
 
-    pub fn export_crt0(&self, path: impl AsRef<Path>) -> Result<()> {
-        use std::io::Write;
-        let mut file = File::create(path)?;
-        writeln!(file, "{}", CRT0)?;
-        Ok(())
-    }
-
     pub fn export_asm(&self, path: impl AsRef<Path>, references: &References, helper: &NsoLookupHelper, mpb: &Option<MultiProgress>, parent: &NSO) -> Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
@@ -561,23 +542,6 @@ impl TextSegment {
     }
 }
 
-#[binread]
-#[derive(Debug)]
-pub struct Module {
-    #[br(temp)]
-    _0: u32,  // might be version
-    pub header_offset: u32,
-    #[br(magic = b"MOD0")]
-    // all of these are relative to beginning of module => add header_offset
-    pub dyn_offset: u32,
-    pub bss_start: u32,
-    pub bss_end: u32,
-    pub ex_info_start_offset: u32,
-    pub ex_info_end_offset: u32,
-    #[br(temp, assert(module_offset == bss_start))]
-    module_offset: u32,
-}
-
 fn construct_capstone() -> anyhow::Result<capstone::Capstone> {
     let mut cs = capstone::Capstone::new()
         .arm64()
@@ -636,24 +600,3 @@ fn get_reg_type(reg: capstone::RegId, cs: &capstone::Capstone) -> anyhow::Result
         _ => bail!("Unsupported register name: {}", name),
     }
 }
-
-const CRT0: &str = r#"
-.section ".text.crt0","ax"
-.global __module_start
-.extern __nx_module_runtime
-
-__module_start:
-    .word 0
-    .word __nx_mod0 - __module_start
-
-.section ".text.mod0"
-.global __nx_mod0
-__nx_mod0:
-    .ascii "MOD0"
-    .word  __dynamic_start__    - __nx_mod0
-    .word  __bss_start__        - __nx_mod0
-    .word  __bss_end__          - __nx_mod0
-    .word  __ex_info_start__    - __nx_mod0
-    .word  __ex_info_end__      - __nx_mod0
-    .word  __nx_module_runtime  - __nx_mod0
-"#;

@@ -6,12 +6,13 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle, ProgressIterator};
 use num_enum::TryFromPrimitive;
 
 use crate::{
-    file_list::Object, nso::{nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}, text::TextSegment}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}, utils::call_with_progress
+    file_list::Object, nso::{nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}, text::TextSection}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}, utils::call_with_progress
 };
 
 pub struct NSO {
     pub file: NsoFile,
-    pub text: TextSegment,
+    pub module: Module,
+    pub text: TextSection,
     pub build_str: String,
     pub symbol_table: (u64, Vec<DynamicSymbol>),
     pub dynamic_segment: Vec<(DynamicTagType, u64)>,
@@ -37,9 +38,19 @@ impl NSO {
         let rodata_segment = &file.memory[rodata_off as usize..(rodata_off + file.header.get_segment_mem_size(&NsoSegment::Rodata)) as usize];
         let data_segment = &file.memory[data_off as usize..(data_off + file.header.get_segment_mem_size(&NsoSegment::Data)) as usize];
 
-        let text = TextSegment::new(text_segment);
+        let mut text = Cursor::new(text_segment);
         let mut rodata = Cursor::new(rodata_segment);
         let mut data = Cursor::new(data_segment);
+
+        let module = Module::read_le(&mut text).unwrap();
+        // TODO: potentially read all 0-bytes until *actual* start of section
+        let text_section_offset = text.position() as usize;
+        let text_section = text_segment[text_section_offset..].to_vec();
+
+        let text = TextSection {
+            section: text_section,
+            section_offset: text_section_offset,
+        };
 
         // .buildstr
         let build_str = Self::parse_buildstr(&mut rodata)?;
@@ -48,7 +59,7 @@ impl NSO {
         let symbol_table = Self::parse_dynamic_symbols(&file.memory, file.header.dynsym_offset + rodata_off, file.header.dynsym_size)?;
 
         // .dynamic
-        let dynamic_offset = (text.module.header_offset + text.module.dyn_offset) as usize;
+        let dynamic_offset = (module.header_offset + module.dyn_offset) as usize;
         let dynamic_segment = Self::parse_dynamic_section(&file.memory[dynamic_offset..])?;
 
         // .hash
@@ -106,18 +117,19 @@ impl NSO {
 
         // .ex_info
         let ex_info = RawSectionMetadata {
-            start_offset: text.module.ex_info_start_offset as u64 + text.module.header_offset as u64,
-            size: (text.module.ex_info_end_offset - text.module.ex_info_start_offset) as u64,
+            start_offset: module.ex_info_start_offset as u64 + module.header_offset as u64,
+            size: (module.ex_info_end_offset - module.ex_info_start_offset) as u64,
         };
 
         // .unknown_rodata
         let unknown_rodata = RawSectionMetadata {
-            start_offset: text.module.ex_info_end_offset as u64 + text.module.header_offset as u64,
-            size: (file.header.embed_offset + rodata_off - text.module.ex_info_end_offset - text.module.header_offset) as u64,
+            start_offset: module.ex_info_end_offset as u64 + module.header_offset as u64,
+            size: (file.header.embed_offset + rodata_off - module.ex_info_end_offset - module.header_offset) as u64,
         };
 
         Ok(NSO {
             file,
+            module,
             text,
             build_str,
             symbol_table,
@@ -151,7 +163,7 @@ impl NSO {
             (".got", Box::new(|(_,_)| self.export_got(path.join("got.s"), &helper))),
             (".init_array", Box::new(|(r,_)| self.export_init_array(path.join("init_array.s"), r, &helper))),
             ("section_start_labels", Box::new(|(_,_)| self.export_section_start_labels(path.join("section_start_labels.s")))),
-            ("crt0", Box::new(|(_,_)| self.text.export_crt0(path.join("crt0.s")))),
+            ("crt0", Box::new(|(_,_)| self.export_crt0(path.join("crt0.s")))),
             ("unknown data gap", Box::new(|(_,_)| self.export_unknown_data_gap(path.join("unknown_data_gap.s")))),
             ("unknown rodata", Box::new(|(_,_)| self.export_unknown_rodata(path.join("unknown_rodata.s")))),
             (".module_name", Box::new(|(_,_)| self.export_module_name(path.join("module_name.s")))),
@@ -595,7 +607,7 @@ impl NSO {
         writeln!(file, ".section \".bss\"")?;
         writeln!(file, "")?;
 
-        let bss_size = (self.text.module.bss_end - self.text.module.bss_start) as u64;
+        let bss_size = (self.module.bss_end - self.module.bss_start) as u64;
         let pb = m.as_ref().map(|m|
             m.add(ProgressBar::new(bss_size))
                 .with_prefix("   [1/1] Exporting .bss:")
@@ -605,7 +617,7 @@ impl NSO {
         for i in 0..bss_size {
             pb.as_ref().map(|p| p.inc(1));
 
-            let bss_entry_offset = self.text.module.bss_start as u64 + self.text.module.header_offset as u64 + i;
+            let bss_entry_offset = self.module.bss_start as u64 + self.module.header_offset as u64 + i;
             if references.has_references_to(bss_entry_offset) {
                 let symbol = self.get_symbol(bss_entry_offset, helper)?;
                 writeln!(file, ".global {}", symbol)?;
@@ -627,7 +639,7 @@ impl NSO {
             path,
             ".data",
             &self.file.memory,
-            self.text.module.header_offset as u64 + self.text.module.dyn_offset as u64 - self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64,
+            self.module.header_offset as u64 + self.module.dyn_offset as u64 - self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64,
             self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64,
             references, helper, m
         )
@@ -637,7 +649,7 @@ impl NSO {
         self.export_data_section(path,
             ".rodata",
             &self.file.memory,
-            self.text.module.ex_info_start_offset as u64 + self.text.module.header_offset as u64 - self.file.header.dynstr_size as u64 - (self.file.header.dynstr_offset as u64 + self.file.header.get_segment_mem_offset(&NsoSegment::Rodata) as u64),
+            self.module.ex_info_start_offset as u64 + self.module.header_offset as u64 - self.file.header.dynstr_size as u64 - (self.file.header.dynstr_offset as u64 + self.file.header.get_segment_mem_offset(&NsoSegment::Rodata) as u64),
             self.file.header.get_segment_mem_offset(&NsoSegment::Rodata) as u64 + self.file.header.dynstr_offset as u64 + self.file.header.dynstr_size as u64,
             references, helper, m
         )
@@ -746,6 +758,13 @@ impl NSO {
         Ok(())
     }
 
+    pub fn export_crt0(&self, path: impl AsRef<Path>) -> Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        writeln!(file, "{}", CRT0)?;
+        Ok(())
+    }
+
     // FIXME: figure out how to properly generate these labels
     fn export_section_start_labels(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         // names from https://github.com/shinyquagsire23/switch-oss/blob/171a7426a95def81c4abf038730130f9e13c6788/src/rocrt_nro.cpp#L116
@@ -782,7 +801,7 @@ impl NSO {
         writeln!(file, "\t.quad 0")?;
 
         // DYNAMIC
-        let dynamic = (self.text.module.header_offset + self.text.module.dyn_offset) as usize;
+        let dynamic = (self.module.header_offset + self.module.dyn_offset) as usize;
         writeln!(file, ".global off_{:X}", dynamic)?;
         writeln!(file, "off_{:X}:", dynamic)?;
         writeln!(file, "\t.quad 0")?;
@@ -1197,3 +1216,41 @@ fn escape_for_asm_string(s: &str) -> String {
     }
     escaped
 }
+
+#[binread]
+#[derive(Debug)]
+pub struct Module {
+    #[br(temp)]
+    _0: u32,  // might be version
+    pub header_offset: u32,
+    #[br(magic = b"MOD0")]
+    // all of these are relative to beginning of module => add header_offset
+    pub dyn_offset: u32,
+    pub bss_start: u32,
+    pub bss_end: u32,
+    pub ex_info_start_offset: u32,
+    pub ex_info_end_offset: u32,
+    #[br(temp, assert(module_offset == bss_start))]
+    module_offset: u32,
+}
+
+const CRT0: &str = r#"
+.section ".text.crt0","ax"
+.global __module_start
+.extern __nx_module_runtime
+
+__module_start:
+    .word 0
+    .word __nx_mod0 - __module_start
+
+.section ".text.mod0"
+.global __nx_mod0
+__nx_mod0:
+    .ascii "MOD0"
+    .word  __dynamic_start__    - __nx_mod0
+    .word  __bss_start__        - __nx_mod0
+    .word  __bss_end__          - __nx_mod0
+    .word  __ex_info_start__    - __nx_mod0
+    .word  __ex_info_end__      - __nx_mod0
+    .word  __nx_module_runtime  - __nx_mod0
+"#;
