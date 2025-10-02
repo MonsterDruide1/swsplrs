@@ -10,13 +10,13 @@ use crate::{file_list::Object, nso::nso::{NsoLookupHelper, RawSectionMetadata, N
 pub struct TextSection {
     pub section: Vec<u8>,
     pub section_offset: usize,  // offset of section within text segment
-    pub plt_functions: HashSet<u64>,  // addresses of functions in the .plt section
+    pub plt_functions: HashMap<u64, u64>,  // addresses of functions in the .plt section and which .got.plt-entry they point to
 }
 impl TextSection {
     pub fn from_data(data: &[u8], offset: usize, got_plt_metadata: &RawSectionMetadata) -> Result<Self> {
         let cs = construct_capstone()?;
 
-        let mut plt_functions = HashSet::new();
+        let mut plt_functions = HashMap::new();
 
         // iterate from end, looking for .plt-function groups:
         //  ADRP X16, #some-.got.plt@PAGE
@@ -57,7 +57,7 @@ impl TextSection {
             };
 
             plt_targets.push(target);
-            plt_functions.insert(current_offset as u64);
+            plt_functions.insert(current_offset as u64, target);
             current_offset -= 4*4;
         }
 
@@ -117,8 +117,9 @@ impl TextSection {
 
             let plt_target = (adrp_target as i64 + ldr_offset) as u64;
             ensure!(plt_target == got_plt_metadata.start_offset + 2*8, "ADRP in pre-PLT block does not point to expected .got.plt entry! Expected 0x{:X}, got 0x{:X}", got_plt_metadata.start_offset + 2*8, plt_target);
+        
+            plt_functions.insert(current_offset as u64, plt_target);
         }
-        plt_functions.insert(current_offset as u64);
 
         Ok(Self {
             section: data[offset..current_offset].to_vec(),
@@ -129,7 +130,7 @@ impl TextSection {
 
     // TODO: automatically analyze function boundaries to avoid `function_starts` and allow symbol-less binaries
     pub fn collect_references(&self, function_starts: &HashSet<u64>, mut reference_tracker: &mut ReferenceTracker, mpb: &Option<MultiProgress>) -> anyhow::Result<()> {
-        let function_starts = function_starts.into_iter().chain(self.plt_functions.iter()).copied().collect::<HashSet<u64>>();
+        let function_starts = function_starts.into_iter().chain(self.plt_functions.iter().map(|(x,_)| x)).copied().collect::<HashSet<u64>>();
         
         let cs = construct_capstone()?;
 
@@ -498,7 +499,7 @@ impl TextSection {
     pub fn export_plt(&self, path: impl AsRef<Path>, got_plt_metadata: &RawSectionMetadata, helper: &NsoLookupHelper, parent: &NSO) -> Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
-        
+
         writeln!(file, ".section \".plt\"")?;
 
         let mut current_offset = self.section_offset as u64 + self.section.len() as u64;
