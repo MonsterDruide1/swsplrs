@@ -68,36 +68,3 @@ impl NsoFile {
         address >= start && address < end
     }
 }
-
-// list/order from https://github.com/h1k421/GLoat/blob/master/libgloat/application.ld
-// with slight adjustments based on nxo64.py, swspl and SMO's segment order
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SectionType {
-    Text,
-    Plt,
-    ModuleName,
-    RelDyn,
-    RelaDyn,
-    RelPlt,
-    RelaPlt,
-    Hash,
-    GnuHash,
-    Dynsym,
-    Dynstr,
-    Rodata,
-    GccExceptTable,
-    EhFrameHdr,
-    EhFrame,
-    NoteGnuBuildId,
-    Data,
-    Dynamic,
-    DataRelaRo,
-    DataRelRo,
-    Got,
-    PreinitArray,
-    InitArray,
-    FiniArray,
-    Tdata,
-    Tbss,
-    Bss,
-}

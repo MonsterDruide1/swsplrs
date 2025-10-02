@@ -6,7 +6,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle, ProgressIterator};
 use num_enum::TryFromPrimitive;
 
 use crate::{
-    file_list::Object, nso::{nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}, text::TextSection}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}, utils::call_with_progress
+    file_list::Object, nso::{nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}, section_map::{SectionMap, SectionType}, text::TextSection}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}, utils::call_with_progress
 };
 
 pub struct NSO {
@@ -31,30 +31,39 @@ pub struct NSO {
 
 impl NSO {
     pub fn new(file: NsoFile) -> anyhow::Result<Self> {
-        let text_off = file.header.get_segment_mem_offset(&NsoSegment::Text);
-        let rodata_off = file.header.get_segment_mem_offset(&NsoSegment::Rodata);
-        let data_off = file.header.get_segment_mem_offset(&NsoSegment::Data);
-        let text_segment = &file.memory[text_off as usize..(text_off + file.header.get_segment_mem_size(&NsoSegment::Text)) as usize];
-        let rodata_segment = &file.memory[rodata_off as usize..(rodata_off + file.header.get_segment_mem_size(&NsoSegment::Rodata)) as usize];
-        let data_segment = &file.memory[data_off as usize..(data_off + file.header.get_segment_mem_size(&NsoSegment::Data)) as usize];
+        let text_off = file.header.get_segment_mem_offset(&NsoSegment::Text) as u64;
+        let rodata_off = file.header.get_segment_mem_offset(&NsoSegment::Rodata) as u64;
+        let data_off = file.header.get_segment_mem_offset(&NsoSegment::Data) as u64;
+        let text_segment = &file.memory[text_off as usize..(text_off + file.header.get_segment_mem_size(&NsoSegment::Text) as u64) as usize];
+        let rodata_segment = &file.memory[rodata_off as usize..(rodata_off + file.header.get_segment_mem_size(&NsoSegment::Rodata) as u64) as usize];
+        let data_segment = &file.memory[data_off as usize..(data_off + file.header.get_segment_mem_size(&NsoSegment::Data) as u64) as usize];
 
         let mut text = Cursor::new(text_segment);
         let mut rodata = Cursor::new(rodata_segment);
         let mut data = Cursor::new(data_segment);
 
+        let mut sections = SectionMap::new(&file.header)?;
+
         // .text.crt0
         let module = Module::read_le(&mut text).unwrap();
         // TODO: potentially read all 0-bytes until *actual* start of section
+        sections.insert_size(text_off, text.position(), SectionType::Crt0)?;
         let text_section_offset = text.position() as usize;
 
         // .dynamic
         let dynamic_offset = (module.header_offset + module.dyn_offset) as usize;
         let dynamic_segment = Self::parse_dynamic_section(&file.memory[dynamic_offset..])?;
+        sections.insert_size(dynamic_offset as u64, (dynamic_segment.len() as u64 + 1) * 16, SectionType::Dynamic)?;
 
         // .rela.plt
         let reloc_plt_table = Self::parse_reloc_table(
             &rodata_segment, &dynamic_segment, DynamicTagType::DT_JMPREL,
             DynamicTagType::DT_PLTRELSZ, &file.header
+        )?;
+        sections.insert_size(
+            Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_JMPREL)?,
+            Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_PLTRELSZ)?,
+            SectionType::RelaPlt
         )?;
 
         // .got.plt
@@ -64,20 +73,36 @@ impl NSO {
         };
         // actually +0x18, but we handle that in export
         // TODO: cleanup
+        sections.insert_size(got_plt_metadata.start_offset, got_plt_metadata.size+0x18, SectionType::GotPlt)?;
 
         // .text
         let text = TextSection::from_data(&text_segment, text_section_offset, &got_plt_metadata)?;
+        sections.insert_size(text_off + text_section_offset as u64, text.section.len() as u64, SectionType::Text)?;
+        sections.insert_size(
+            text_off + text_section_offset as u64 + text.section.len() as u64,
+            (got_plt_metadata.size/8) * 4*4 + 8*4,
+            SectionType::Plt
+        )?;
 
         // .buildstr
         let build_str = Self::parse_buildstr(&mut rodata)?;
+        sections.insert_size(rodata_off, rodata.position() as u64, SectionType::ModuleName)?;
+        sections.insert_align(rodata_off + rodata.position() as u64, 8)?;
+
 
         // .dynsym
-        let symbol_table = Self::parse_dynamic_symbols(&file.memory, file.header.dynsym_offset + rodata_off, file.header.dynsym_size)?;
+        let symbol_table = Self::parse_dynamic_symbols(&file.memory, file.header.dynsym_offset as u64 + rodata_off, file.header.dynsym_size as u64)?;
+        sections.insert_size(file.header.dynsym_offset as u64 + rodata_off, file.header.dynsym_size as u64, SectionType::Dynsym)?;
 
         // .hash
         let hash_table = Self::parse_hash_table(
             &file.memory,
             Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_HASH)? as u32
+        )?;
+        sections.insert_size(
+            Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_HASH)?,
+            (8 + (hash_table.nbucket + hash_table.nchain) * 4) as u64,
+            SectionType::Hash
         )?;
 
         // .gnu.hash
@@ -85,15 +110,27 @@ impl NSO {
             &file.memory,
             Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_GNU_HASH)? as u32
         )?;
+        sections.insert_size(
+            Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_GNU_HASH)?,
+            (16 + gnu_hash_table.mask * 8 + gnu_hash_table.nbuckets * 4 + gnu_hash_table.chains.len() as u32 * 4) as u64,
+            SectionType::GnuHash
+        )?;
+        sections.insert_align(sections.get_range(&SectionType::GnuHash).unwrap().end, 8)?;
 
         // .rela.dyn
         let reloc_dyn_table = Self::parse_reloc_table(
             &rodata_segment, &dynamic_segment, DynamicTagType::DT_RELA,
             DynamicTagType::DT_RELASZ, &file.header
         )?;
+        sections.insert_size(
+            Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_RELA)?,
+            Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_RELASZ)?,
+            SectionType::RelaDyn
+        )?;
 
         // .dynstr
         let dynstr_table = Self::parse_dynamic_string_table(&rodata_segment, file.header.dynstr_offset, file.header.dynstr_size)?;
+        sections.insert_size(file.header.dynstr_offset as u64 + rodata_off, file.header.dynstr_size as u64, SectionType::Dynstr)?;
         
         // .got
         let got_start_offset = got_plt_metadata.start_offset + got_plt_metadata.size+0x18;  // 0x18 for three 0 entries at the start
@@ -101,6 +138,7 @@ impl NSO {
             start_offset: got_start_offset,
             size: Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_INIT_ARRAY)? - got_start_offset,
         };
+        sections.insert_size(got_metadata.start_offset, got_metadata.size, SectionType::Got)?;
 
         // .init_array
         let init_array_offset = Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_INIT_ARRAY)?;
@@ -109,21 +147,43 @@ impl NSO {
             init_array_offset,
             Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_INIT_ARRAYSZ)? / 8
         )?;
+        sections.insert_size(init_array_offset, (init_array.len() * 8) as u64, SectionType::InitArray)?;
 
         // .embed
-        let embed = Self::parse_embed(&file.memory, file.header.embed_offset + rodata_off, file.header.embed_size)?;
+        let embed = Self::parse_embed(&file.memory, file.header.embed_offset as u64 + rodata_off, file.header.embed_size as u64)?;
+        sections.insert_size(file.header.embed_offset as u64 + rodata_off, file.header.embed_size as u64, SectionType::Embed)?;
 
         // .ex_info
         let ex_info = RawSectionMetadata {
             start_offset: module.ex_info_start_offset as u64 + module.header_offset as u64,
             size: (module.ex_info_end_offset - module.ex_info_start_offset) as u64,
         };
+        sections.insert_size(ex_info.start_offset, ex_info.size, SectionType::ExInfo)?;
 
         // .unknown_rodata
         let unknown_rodata = RawSectionMetadata {
             start_offset: module.ex_info_end_offset as u64 + module.header_offset as u64,
-            size: (file.header.embed_offset + rodata_off - module.ex_info_end_offset - module.header_offset) as u64,
+            size: (file.header.embed_offset as u64 + rodata_off - module.ex_info_end_offset as u64 - module.header_offset as u64) as u64,
         };
+        sections.insert_size(unknown_rodata.start_offset, unknown_rodata.size, SectionType::UnknownRodata)?;
+
+        sections.insert(
+            sections.get_range(&SectionType::Dynstr).unwrap().end,
+            sections.get_range(&SectionType::ExInfo).unwrap().start,
+            SectionType::Rodata
+        )?;
+        sections.insert(
+            data_off,
+            sections.get_range(&SectionType::Dynamic).unwrap().start,
+            SectionType::Data
+        )?;
+        sections.insert(
+            sections.get_range(&SectionType::Dynamic).unwrap().end,
+            sections.get_range(&SectionType::GotPlt).unwrap().start,
+            SectionType::UnknownData
+        )?;
+
+        sections.final_check()?;
 
         Ok(NSO {
             file,
@@ -282,7 +342,7 @@ impl NSO {
         Ok(build_str.to_string())
     }
 
-    fn parse_dynamic_symbols(memory: &[u8], dynsym_offset: u32, dynsym_size: u32) -> anyhow::Result<(u64, Vec<DynamicSymbol>)> {
+    fn parse_dynamic_symbols(memory: &[u8], dynsym_offset: u64, dynsym_size: u64) -> anyhow::Result<(u64, Vec<DynamicSymbol>)> {
         let num_symbols = dynsym_size as usize / std::mem::size_of::<DynamicSymbol>();
         let mut symbols = Vec::with_capacity(num_symbols);
         for i in 0..num_symbols {
@@ -411,7 +471,7 @@ impl NSO {
         })
     }
 
-    fn parse_embed(memory: &[u8], embed_offset: u32, embed_size: u32) -> anyhow::Result<Vec<(u64, String)>> {
+    fn parse_embed(memory: &[u8], embed_offset: u64, embed_size: u64) -> anyhow::Result<Vec<(u64, String)>> {
         let embed_data = &memory[embed_offset as usize .. (embed_offset + embed_size) as usize];
         let mut cursor = Cursor::new(embed_data);
         let mut strings = Vec::new();

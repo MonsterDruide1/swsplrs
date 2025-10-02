@@ -1,6 +1,7 @@
 use binrw::{BinRead, binread};
+use strum_macros::EnumIter;
 
-#[derive(Debug)]
+#[derive(Debug, EnumIter)]
 pub enum NsoSegment {
     Text,
     Rodata,
