@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, fs::File, path::Path, u64};
+use std::{collections::{HashMap, HashSet}, fs::File, ops::Range, path::Path, u64};
 
 use anyhow::{bail, ensure, Result};
 use capstone::{self, arch::{arm64::{Arm64Operand, Arm64OperandType, Arm64Reg}, ArchOperand, BuildsCapstone, BuildsCapstoneEndian}, Capstone, Insn, InsnGroupId, RegId};
@@ -13,7 +13,7 @@ pub struct TextSection {
     pub plt_functions: HashMap<u64, u64>,  // addresses of functions in the .plt section and which .got.plt-entry they point to
 }
 impl TextSection {
-    pub fn from_data(data: &[u8], offset: usize, got_plt_metadata: &RawSectionMetadata) -> Result<Self> {
+    pub fn from_data(data: &[u8], offset: usize, got_plt: Range<u64>) -> Result<Self> {
         let cs = construct_capstone()?;
 
         let mut plt_functions = HashMap::new();
@@ -62,8 +62,8 @@ impl TextSection {
         }
 
         plt_targets.reverse();
-        for i in 3..got_plt_metadata.size/8 {
-            ensure!(plt_targets.get((i-3) as usize) == Some(&(got_plt_metadata.start_offset + i*8)), "PLT target at index {} does not match expected .got.plt entry at 0x{:X}", i-3, got_plt_metadata.start_offset + i*8);
+        for i in 3..(got_plt.end-got_plt.start)/8 {
+            ensure!(plt_targets.get((i-3) as usize) == Some(&(got_plt.start + i*8)), "PLT target at index {} does not match expected .got.plt entry at 0x{:X}", i-3, got_plt.start + i*8);
         }
 
         // block before is still .plt:
@@ -116,7 +116,7 @@ impl TextSection {
             ensure!(nop3.mnemonic().unwrap_or("") == "nop", "Expected third NOP instruction at 0x{:X}, got {}", nop3.address(), nop3.mnemonic().unwrap_or("UNKNOWN"));
 
             let plt_target = (adrp_target as i64 + ldr_offset) as u64;
-            ensure!(plt_target == got_plt_metadata.start_offset + 2*8, "ADRP in pre-PLT block does not point to expected .got.plt entry! Expected 0x{:X}, got 0x{:X}", got_plt_metadata.start_offset + 2*8, plt_target);
+            ensure!(plt_target == got_plt.start + 2*8, "ADRP in pre-PLT block does not point to expected .got.plt entry! Expected 0x{:X}, got 0x{:X}", got_plt.start + 2*8, plt_target);
         
             plt_functions.insert(current_offset as u64, plt_target);
         }
@@ -496,14 +496,14 @@ impl TextSection {
         Ok(())
     }
 
-    pub fn export_plt(&self, path: impl AsRef<Path>, got_plt_metadata: &RawSectionMetadata, helper: &NsoLookupHelper, parent: &NSO) -> Result<()> {
+    pub fn export_plt(&self, path: impl AsRef<Path>, got_plt: &Range<u64>, helper: &NsoLookupHelper, parent: &NSO) -> Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
 
         writeln!(file, ".section \".plt\"")?;
 
         let mut current_offset = self.section_offset as u64 + self.section.len() as u64;
-        let mut current_target = got_plt_metadata.start_offset + 0x10;
+        let mut current_target = got_plt.start + 0x10;
 
         writeln!(file, ".global {}", parent.get_symbol(current_offset, helper)?)?;
         writeln!(file, "{}:", parent.get_symbol(current_offset, helper)?)?;
@@ -519,7 +519,7 @@ impl TextSection {
         current_offset += 4*8;
         current_target += 8;
 
-        for i in 0..got_plt_metadata.size/8 {
+        for i in 3..(got_plt.end-got_plt.start)/8 {
             writeln!(file)?;
             writeln!(file, ".global {}", parent.get_symbol(current_offset, helper)?)?;
             writeln!(file, "{}:", parent.get_symbol(current_offset, helper)?)?;

@@ -11,6 +11,7 @@ use crate::{
 
 pub struct NSO {
     pub file: NsoFile,
+    pub sections: SectionMap,
     pub module: Module,
     pub text: TextSection,
     pub build_str: String,
@@ -19,14 +20,10 @@ pub struct NSO {
     pub reloc_dyn_table: Vec<Relocation>,
     pub reloc_plt_table: Vec<Relocation>,
     pub dynstr_table: BTreeMap<u64, String>,
-    pub got_plt_metadata: RawSectionMetadata,
-    pub got_metadata: RawSectionMetadata,
     pub init_array: (u64, Vec<u64>),  // offset + entries
     pub hash_table: HashTable,
     pub gnu_hash_table: GnuHashTable,
     pub embed: Vec<(u64, String)>,  // offset + content
-    pub ex_info: RawSectionMetadata,
-    pub unknown_rodata: RawSectionMetadata,
 }
 
 impl NSO {
@@ -69,18 +66,16 @@ impl NSO {
         // .got.plt
         let got_plt_metadata = RawSectionMetadata {
             start_offset: Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_PLTGOT)? as u64,
-            size: reloc_plt_table.iter().filter(|r| r.reloc_type == RelocationType::R_AARCH64_JUMP_SLOT).count() as u64 * 8,
+            size: reloc_plt_table.iter().filter(|r| r.reloc_type == RelocationType::R_AARCH64_JUMP_SLOT).count() as u64 * 8 + 0x18,
         };
-        // actually +0x18, but we handle that in export
-        // TODO: cleanup
-        sections.insert_size(got_plt_metadata.start_offset, got_plt_metadata.size+0x18, SectionType::GotPlt)?;
+        sections.insert_size(got_plt_metadata.start_offset, got_plt_metadata.size, SectionType::GotPlt)?;
 
         // .text
-        let text = TextSection::from_data(&text_segment, text_section_offset, &got_plt_metadata)?;
+        let text = TextSection::from_data(&text_segment, text_section_offset, sections.get_range(&SectionType::GotPlt).expect(".got.plt section not found"))?;
         sections.insert_size(text_off + text_section_offset as u64, text.section.len() as u64, SectionType::Text)?;
         sections.insert_size(
             text_off + text_section_offset as u64 + text.section.len() as u64,
-            (got_plt_metadata.size/8) * 4*4 + 8*4,
+            (got_plt_metadata.size/8 - 3) * 4*4 + 8*4,
             SectionType::Plt
         )?;
 
@@ -133,7 +128,7 @@ impl NSO {
         sections.insert_size(file.header.dynstr_offset as u64 + rodata_off, file.header.dynstr_size as u64, SectionType::Dynstr)?;
         
         // .got
-        let got_start_offset = got_plt_metadata.start_offset + got_plt_metadata.size+0x18;  // 0x18 for three 0 entries at the start
+        let got_start_offset = got_plt_metadata.start_offset + got_plt_metadata.size;
         let got_metadata = RawSectionMetadata {
             start_offset: got_start_offset,
             size: Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_INIT_ARRAY)? - got_start_offset,
@@ -187,6 +182,7 @@ impl NSO {
 
         Ok(NSO {
             file,
+            sections,
             module,
             text,
             build_str,
@@ -195,14 +191,10 @@ impl NSO {
             reloc_dyn_table,
             reloc_plt_table,
             dynstr_table,
-            got_plt_metadata,
-            got_metadata,
             init_array: (init_array_offset, init_array),
             hash_table,
             gnu_hash_table,
             embed,
-            ex_info,
-            unknown_rodata,
         })
     }
 
@@ -234,7 +226,7 @@ impl NSO {
             (".gnu.hash", Box::new(|(_,_)| self.export_gnu_hash(path.join("gnu_hash.s")))),
             (".ex_info", Box::new(|(_,_)| self.export_ex_info(path.join("ex_info.s")))),
             (".embed", Box::new(|(_,_)| self.export_embed(path.join("embed.s"), &helper))),
-            (".plt", Box::new(|(_,_)| self.text.export_plt(path.join("plt.s"), &self.got_plt_metadata, &helper, &self))),
+            (".plt", Box::new(|(_,_)| self.text.export_plt(path.join("plt.s"), &self.sections.get_range(&SectionType::GotPlt).unwrap(), &helper, &self))),
             (".text", Box::new(|(r,m)| self.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
             (".bss", Box::new(|(r,m)| self.export_bss(path.join("bss.s"), r, &helper, m))),
             (".data", Box::new(|(r,m)| self.export_data(path.join("data.s"), r, &helper, m))),
@@ -569,7 +561,8 @@ impl NSO {
         writeln!(file, ".section \".got.plt\"")?;
         writeln!(file, "")?;
 
-        let mut got_plt_mem_offset = Self::get_dynamic_tag_value(&self.dynamic_segment, DynamicTagType::DT_PLTGOT)?;
+        let got_plt_range = self.sections.get_range(&SectionType::GotPlt).expect(".got.plt section not found");
+        let mut got_plt_mem_offset = got_plt_range.start;
 
         for _ in 0..3 {
             writeln!(file, ".global off_{:X}", got_plt_mem_offset)?;
@@ -579,7 +572,7 @@ impl NSO {
             got_plt_mem_offset += 8;
         }
 
-        for i in 0..self.got_plt_metadata.size/8 {
+        for i in 0..(got_plt_range.end-got_plt_range.start)/8-3 {
             let entry = &self.reloc_plt_table[i as usize];
             let sym = &self.symbol_table.1[entry.sym_idx as usize];
             let name = &self.dynstr_table[&(sym.str_table_offset as u64)];
@@ -602,8 +595,11 @@ impl NSO {
         writeln!(file, ".section \".got\"")?;
         writeln!(file, "")?;
 
-        for i in 0..self.got_metadata.size/8 {
-            let got_entry_offset = self.got_metadata.start_offset + i * 8;
+        let got_range = self.sections.get_range(&SectionType::Got).expect(".got section not found");
+        let got_size = got_range.end - got_range.start;
+
+        for i in 0..got_size/8 {
+            let got_entry_offset = got_range.start + i * 8;
             writeln!(file, ".global off_{:X}", got_entry_offset)?;
             writeln!(file, "off_{:X}:", got_entry_offset)?;
 
@@ -1004,11 +1000,14 @@ impl NSO {
         let mut file = File::create(path)?;
         writeln!(file, ".section \".ex_info\", \"a\"")?;
 
+        let ex_info_range = self.sections.get_range(&SectionType::ExInfo).expect(".ex_info section not found");
+        let ex_info_size = ex_info_range.end - ex_info_range.start;
+
         let cursor = &mut Cursor::new(&self.file.memory[
-            self.ex_info.start_offset as usize ..
-            (self.ex_info.start_offset as u64 + self.ex_info.size) as usize
+            ex_info_range.start as usize ..
+            ex_info_range.end as usize
         ]);
-        for _ in 0..self.ex_info.size {
+        for _ in 0..ex_info_size {
             writeln!(file, ".byte 0x{:X}", cursor.read_le::<u8>()?)?;
         }
 
@@ -1020,11 +1019,14 @@ impl NSO {
         let mut file = File::create(path)?;
         writeln!(file, ".section \".unknown_rodata\", \"a\"")?;
 
+        let unknown_rodata_range = self.sections.get_range(&SectionType::UnknownRodata).expect(".unknown_rodata section not found");
+        let unknown_rodata_size = unknown_rodata_range.end - unknown_rodata_range.start;
+
         let cursor = &mut Cursor::new(&self.file.memory[
-            self.unknown_rodata.start_offset as usize ..
-            (self.unknown_rodata.start_offset as u64 + self.unknown_rodata.size) as usize
+            unknown_rodata_range.start as usize ..
+            unknown_rodata_range.end as usize
         ]);
-        for _ in 0..self.unknown_rodata.size {
+        for _ in 0..unknown_rodata_size {
             writeln!(file, ".byte 0x{:X}", cursor.read_le::<u8>()?)?;
         }
 
