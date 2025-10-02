@@ -5,7 +5,7 @@ use capstone::{self, arch::{arm64::{Arm64Operand, Arm64OperandType, Arm64Reg}, A
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rangemap::RangeMap;
 
-use crate::{file_list::Object, nso::nso::{NsoLookupHelper, RawSectionMetadata, NSO}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}};
+use crate::{file_list::Object, nso::nso::{NsoLookupHelper, NSO}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}};
 
 pub struct TextSection {
     pub section: Vec<u8>,
@@ -519,7 +519,7 @@ impl TextSection {
         current_offset += 4*8;
         current_target += 8;
 
-        for i in 3..(got_plt.end-got_plt.start)/8 {
+        for _ in 3..(got_plt.end-got_plt.start)/8 {
             writeln!(file)?;
             writeln!(file, ".global {}", parent.get_symbol(current_offset, helper)?)?;
             writeln!(file, "{}:", parent.get_symbol(current_offset, helper)?)?;

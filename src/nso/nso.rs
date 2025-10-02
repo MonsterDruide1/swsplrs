@@ -64,18 +64,19 @@ impl NSO {
         )?;
 
         // .got.plt
-        let got_plt_metadata = RawSectionMetadata {
-            start_offset: Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_PLTGOT)? as u64,
-            size: reloc_plt_table.iter().filter(|r| r.reloc_type == RelocationType::R_AARCH64_JUMP_SLOT).count() as u64 * 8 + 0x18,
-        };
-        sections.insert_size(got_plt_metadata.start_offset, got_plt_metadata.size, SectionType::GotPlt)?;
+        let got_plt_entries = reloc_plt_table.iter().filter(|r| r.reloc_type == RelocationType::R_AARCH64_JUMP_SLOT).count() as u64;
+        sections.insert_size(
+            Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_PLTGOT)? as u64,
+            got_plt_entries * 8 + 0x18,
+            SectionType::GotPlt
+        )?;
 
         // .text
         let text = TextSection::from_data(&text_segment, text_section_offset, sections.get_range(&SectionType::GotPlt).expect(".got.plt section not found"))?;
         sections.insert_size(text_off + text_section_offset as u64, text.section.len() as u64, SectionType::Text)?;
         sections.insert_size(
             text_off + text_section_offset as u64 + text.section.len() as u64,
-            (got_plt_metadata.size/8 - 3) * 4*4 + 8*4,
+            got_plt_entries * 4*4 + 8*4,
             SectionType::Plt
         )?;
 
@@ -128,12 +129,11 @@ impl NSO {
         sections.insert_size(file.header.dynstr_offset as u64 + rodata_off, file.header.dynstr_size as u64, SectionType::Dynstr)?;
         
         // .got
-        let got_start_offset = got_plt_metadata.start_offset + got_plt_metadata.size;
-        let got_metadata = RawSectionMetadata {
-            start_offset: got_start_offset,
-            size: Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_INIT_ARRAY)? - got_start_offset,
-        };
-        sections.insert_size(got_metadata.start_offset, got_metadata.size, SectionType::Got)?;
+        sections.insert(
+            sections.get_range(&SectionType::GotPlt).unwrap().end,
+            Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_INIT_ARRAY)?,
+            SectionType::Got
+        )?;
 
         // .init_array
         let init_array_offset = Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_INIT_ARRAY)?;
@@ -149,18 +149,18 @@ impl NSO {
         sections.insert_size(file.header.embed_offset as u64 + rodata_off, file.header.embed_size as u64, SectionType::Embed)?;
 
         // .ex_info
-        let ex_info = RawSectionMetadata {
-            start_offset: module.ex_info_start_offset as u64 + module.header_offset as u64,
-            size: (module.ex_info_end_offset - module.ex_info_start_offset) as u64,
-        };
-        sections.insert_size(ex_info.start_offset, ex_info.size, SectionType::ExInfo)?;
+        sections.insert(
+            module.ex_info_start_offset as u64 + module.header_offset as u64,
+            module.ex_info_end_offset as u64 + module.header_offset as u64,
+            SectionType::ExInfo
+        )?;
 
         // .unknown_rodata
-        let unknown_rodata = RawSectionMetadata {
-            start_offset: module.ex_info_end_offset as u64 + module.header_offset as u64,
-            size: (file.header.embed_offset as u64 + rodata_off - module.ex_info_end_offset as u64 - module.header_offset as u64) as u64,
-        };
-        sections.insert_size(unknown_rodata.start_offset, unknown_rodata.size, SectionType::UnknownRodata)?;
+        sections.insert(
+            module.ex_info_end_offset as u64 + module.header_offset as u64,
+            file.header.embed_offset as u64 + rodata_off,
+            SectionType::UnknownRodata
+        )?;
 
         sections.insert(
             sections.get_range(&SectionType::Dynstr).unwrap().end,
@@ -1226,14 +1226,6 @@ pub struct GnuHashTable {
     pub buckets: Vec<u32>,
     pub chains: Vec<u32>,
 }
-
-#[derive(Debug)]
-pub struct RawSectionMetadata {
-    pub start_offset: u64,
-    pub size: u64,
-}
-
-
 
 pub struct NsoLookupHelper {
     reloc_dyn_addr_to_idx: HashMap<u64, usize>,
