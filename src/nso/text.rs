@@ -510,7 +510,7 @@ impl TextSection {
                 }
             }
 
-            // custom re-mappings because of canonicalization
+            // custom re-mappings because of canonicalization of capstone
             "mov" => {
                 let bytes = instr.bytes();
                 // mov x0, #imm  =>  orr x0, xzr, #imm

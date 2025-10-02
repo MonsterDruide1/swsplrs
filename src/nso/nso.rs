@@ -42,11 +42,31 @@ impl NSO {
         let mut rodata = Cursor::new(rodata_segment);
         let mut data = Cursor::new(data_segment);
 
+        // .text.crt0
         let module = Module::read_le(&mut text).unwrap();
         // TODO: potentially read all 0-bytes until *actual* start of section
         let text_section_offset = text.position() as usize;
-        let text_section = text_segment[text_section_offset..].to_vec();
 
+        // .dynamic
+        let dynamic_offset = (module.header_offset + module.dyn_offset) as usize;
+        let dynamic_segment = Self::parse_dynamic_section(&file.memory[dynamic_offset..])?;
+
+        // .rela.plt
+        let reloc_plt_table = Self::parse_reloc_table(
+            &rodata_segment, &dynamic_segment, DynamicTagType::DT_JMPREL,
+            DynamicTagType::DT_PLTRELSZ, &file.header
+        )?;
+
+        // .got.plt
+        let got_plt_metadata = RawSectionMetadata {
+            start_offset: Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_PLTGOT)? as u64,
+            size: reloc_plt_table.iter().filter(|r| r.reloc_type == RelocationType::R_AARCH64_JUMP_SLOT).count() as u64 * 8,
+        };
+        // actually +0x18, but we handle that in export
+        // TODO: cleanup
+
+        // .text
+        let text_section = text_segment[text_section_offset..].to_vec();
         let text = TextSection {
             section: text_section,
             section_offset: text_section_offset,
@@ -57,10 +77,6 @@ impl NSO {
 
         // .dynsym
         let symbol_table = Self::parse_dynamic_symbols(&file.memory, file.header.dynsym_offset + rodata_off, file.header.dynsym_size)?;
-
-        // .dynamic
-        let dynamic_offset = (module.header_offset + module.dyn_offset) as usize;
-        let dynamic_segment = Self::parse_dynamic_section(&file.memory[dynamic_offset..])?;
 
         // .hash
         let hash_table = Self::parse_hash_table(
@@ -80,23 +96,9 @@ impl NSO {
             DynamicTagType::DT_RELASZ, &file.header
         )?;
 
-        // .rela.plt
-        let reloc_plt_table = Self::parse_reloc_table(
-            &rodata_segment, &dynamic_segment, DynamicTagType::DT_JMPREL,
-            DynamicTagType::DT_PLTRELSZ, &file.header
-        )?;
-
         // .dynstr
         let dynstr_table = Self::parse_dynamic_string_table(&rodata_segment, file.header.dynstr_offset, file.header.dynstr_size)?;
         
-        // .got.plt
-        let got_plt_metadata = RawSectionMetadata {
-            start_offset: Self::get_dynamic_tag_value(&dynamic_segment, DynamicTagType::DT_PLTGOT)? as u64,
-            size: reloc_plt_table.iter().filter(|r| r.reloc_type == RelocationType::R_AARCH64_JUMP_SLOT).count() as u64 * 8,
-        };
-        // actually +0x18, but we handle that in export
-        // TODO: cleanup
-
         // .got
         let got_start_offset = got_plt_metadata.start_offset + got_plt_metadata.size+0x18;  // 0x18 for three 0 entries at the start
         let got_metadata = RawSectionMetadata {
