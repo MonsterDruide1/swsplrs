@@ -68,21 +68,6 @@ SECTIONS
     *(.rodata .rodata.*)
   } :rodata
 
-  .ex_info : {
-    HIDDEN(__ex_info_start__ = .);
-    KEEP(*(.ex_info))
-    HIDDEN(__ex_info_end__ = .);
-  } :rodata
-
-  .unknown_rodata : {
-    KEEP(*(.unknown_rodata))
-  } :rodata
-
-  /* Embed: Version data of libraries */
-  .embed : {
-    KEEP(*(.embed))
-  } :rodata
-
   /* All exception handling sections */
   .gcc_except_table : { *(.gcc_except_table .gcc_except_table.*) } :rodata
   .eh_frame_hdr : {
@@ -94,6 +79,11 @@ SECTIONS
 
   /* Misc .rodata stuffs (build-id, ect) */
   .note.gnu.build-id : { *(.note.gnu.build-id) } :rodata
+
+  /* Embed: Version data of libraries */
+  .embed : {
+    KEEP(*(.embed))
+  } :rodata
 
   /* Read-write sections */
   . = ALIGN(0x1000);

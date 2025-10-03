@@ -93,8 +93,6 @@ pub enum SectionType {
     Rodata,
     // these might be GccExceptTable, EhFrame?
     Embed,
-    ExInfo,
-    UnknownRodata,
     //
     GccExceptTable,
     EhFrameHdr,
