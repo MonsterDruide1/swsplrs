@@ -6,6 +6,7 @@ use strum::IntoEnumIterator;
 
 use crate::nso::nso_header::{NsoHeader, NsoSegment};
 
+#[derive(Debug, Clone)]
 pub struct SectionMap {
     map: RangeMap<u64, SectionType>,
 }

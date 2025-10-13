@@ -158,6 +158,7 @@ impl NSO {
             eh_frame_hdr_size,
             SectionType::EhFrameHdr
         )?;
+        ensure!(eh_frame_hdr_size == (module.ex_info_end_offset - module.ex_info_start_offset) as u64, "Unexpected .eh_frame_hdr size: expected {}, got {}", (module.ex_info_end_offset - module.ex_info_start_offset), eh_frame_hdr_size);
 
         // .eh_frame
         sections.insert(
@@ -165,6 +166,7 @@ impl NSO {
             file.header.embed_offset as u64 + rodata_off,
             SectionType::EhFrame
         )?;
+        // TODO: also contains the build ID (.note.gnu.build-id) at its end
 
         sections.insert(
             sections.get_range(&SectionType::Dynstr).unwrap().end,
@@ -180,6 +182,16 @@ impl NSO {
             sections.get_range(&SectionType::Dynamic).unwrap().end,
             sections.get_range(&SectionType::GotPlt).unwrap().start,
             SectionType::UnknownData
+        )?;
+        sections.insert(
+            (module.bss_start + module.header_offset) as u64,
+            (module.bss_end + module.header_offset) as u64,
+            SectionType::Bss
+        )?;
+        sections.insert_size(
+            sections.get_range(&SectionType::InitArray).expect("No InitArray section found").end,
+            8,
+            SectionType::Tbss,  // TODO: figure out what this is - 1e61400 in SMO
         )?;
 
         sections.final_check()?;
@@ -325,6 +337,25 @@ impl NSO {
             "off"
         };
         Ok(format!("{}_{:X}", prefix, address))
+    }
+
+    pub fn get_got_target_symbol(&self, got_address: u64, references: &References, helper: &NsoLookupHelper) -> Result<String> {
+        ensure!(vec![SectionType::Got, SectionType::GotPlt].contains(self.sections.get(got_address).expect("no section")), "GOT address {:X} is not in .got section", got_address);
+        let target = references.get_target_address(got_address).ok_or_else(|| anyhow::anyhow!("No reference found for GOT entry at {:X}", got_address))?;
+        let target_type = references.get_type_of(target).ok_or_else(|| anyhow::anyhow!("No reference type found for GOT target at {:X}", target))?;
+        let DataRefType::SymbolAbsolute(addend) = target_type else {
+            return Ok(self.get_symbol(target, helper)?);
+        };
+        ensure!(addend == 0, "GOT target at {:X} has unexpected addend: {}", target, addend);
+        //let symbol_offset = self.symbol_table.0 + relocation.sym_idx as u64 * std::mem::size_of::<DynamicSymbol>() as u64;
+        let symbol_idx = (target - self.symbol_table.0) / std::mem::size_of::<DynamicSymbol>() as u64;
+        let Some(symbol) = self.symbol_table.1.get(symbol_idx as usize) else {
+            bail!("No symbol found for GOT target at {:X}", target);
+        };
+        let Some(name) = self.dynstr_table.get(&(symbol.str_table_offset as u64)) else {
+            bail!("Symbol at {:X} has no name", target);
+        };
+        Ok(name.clone())
     }
 
     fn parse_buildstr(data: &mut Cursor<&[u8]>) -> Result<String> {
@@ -579,6 +610,11 @@ impl NSO {
                 }
                 _ => bail!("Unsupported relocation type {:?} in .rela.dyn", relocation.reloc_type),
             }
+        }
+        for relocation in self.reloc_plt_table.iter() {
+            ensure!(relocation.reloc_type == RelocationType::R_AARCH64_JUMP_SLOT, "Unsupported relocation type {:?} in .rela.plt", relocation.reloc_type);
+            let symbol_offset = self.symbol_table.0 + relocation.sym_idx as u64 * std::mem::size_of::<DynamicSymbol>() as u64;
+            reference_tracker.add_reference(symbol_offset, ReferenceSource::Relocation, relocation.offset, DataRefType::SymbolAbsolute(relocation.addend));
         }
         Ok(())
     }

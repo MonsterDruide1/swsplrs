@@ -5,7 +5,7 @@ use capstone::{self, arch::{arm64::{Arm64Operand, Arm64OperandType, Arm64Reg}, A
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rangemap::RangeMap;
 
-use crate::{file_list::Object, nso::nso::{NsoLookupHelper, NSO}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}};
+use crate::{file_list::Object, nso::{nso::{NsoLookupHelper, NSO}, section_map::SectionType}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}};
 
 pub struct TextSection {
     pub section: Vec<u8>,
@@ -549,6 +549,12 @@ impl TextSection {
                 .with_style(ProgressStyle::with_template("{prefix} {wide_bar} {binary_bytes}/{binary_total_bytes}  ").unwrap())
         );
 
+        for plt_target in self.plt_functions.values() {
+            if let Ok(got_target) = parent.get_got_target_symbol(*plt_target, references, helper) {
+                writeln!(file, ".type {}, %function", got_target)?;
+            }
+        }
+
         // TODO .fill {dist}, 1, 0 ???
         while let Some(instr) = iter.next() {
             pb.as_ref().map(|p| p.inc(4));
@@ -630,7 +636,13 @@ impl TextSection {
             // branching/jumps/calls
             //  blr, br, ret remain unchanged
             "bl" | "b" => {
-                writeln!(file, "\t{} {}", mnemonic, parent.get_symbol(reference_target?, helper)?)?;
+                let target = reference_target?;
+                if let Some(plt_target) = self.plt_functions.get(&target) {
+                    let got_target = parent.get_got_target_symbol(*plt_target, references, helper)?;
+                    writeln!(file, "\t{} {}", mnemonic, got_target)?;
+                } else {
+                    writeln!(file, "\t{} {}", mnemonic, parent.get_symbol(target, helper)?)?;
+                }
             }
             "tbz" | "tbnz" => {
                 writeln!(file, "\t{} {}, #{}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_imm(&detail, 1)?, parent.get_symbol(reference_target?, helper)?)?;
@@ -645,12 +657,33 @@ impl TextSection {
             // loads/stores
             "adr" => {bail!("Unhandled adr instruction at 0x{:X}", instr.address());}
             "adrp" => {
-                writeln!(file, "\t{} {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, parent.get_symbol(reference_target?, helper)?)?;
+                let target = reference_target?;
+                let &section = parent.sections.get(target).expect("Reference target not in any section");
+                match section {
+                    SectionType::Data | SectionType::Bss | SectionType::Rodata | SectionType::Text | SectionType::Embed => {
+                        writeln!(file, "\t{} {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, parent.get_symbol(target, helper)?)?;
+                    },
+                    SectionType::Got => {
+                        writeln!(file, "\t{} {}, :got:{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, parent.get_got_target_symbol(target, references, helper)?)?;
+                        //writeln!(file, "\t{} {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, parent.get_symbol(target, helper)?)?;
+                    }
+                    _ => bail!("Unhandled adrp target section type for instruction at 0x{:X}: {:?}", instr.address(), section),
+                }
             }
             "add" => {
                 // we are only interested in adds with last operand being an immediate (=> offset)
                 if let Ok(_) = get_operand_imm(&detail, 2) && let Ok(target) = reference_target {
-                    writeln!(file, "\t{} {}, {}, :lo12:{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, parent.get_symbol(target, helper)?)?;
+                    let &section = parent.sections.get(target).expect("Reference target not in any section");
+                    match section {
+                        SectionType::Data | SectionType::Bss | SectionType::Rodata | SectionType::Text | SectionType::Embed => {
+                            writeln!(file, "\t{} {}, {}, :lo12:{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, parent.get_symbol(target, helper)?)?;
+                        },
+                        SectionType::Got => {
+                            writeln!(file, "\t{} {}, {}, :got_lo12:{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, parent.get_got_target_symbol(target, references, helper)?)?;
+                            //writeln!(file, "\t{} {}, {}, :lo12:{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, parent.get_symbol(target, helper)?)?;
+                        }
+                        _ => bail!("Unhandled ldr/str target section type for instruction at 0x{:X}: {:?}", instr.address(), section),
+                    }
                 } else {
                     writeln!(file, "\t{} {}", mnemonic, instr.op_str().ok_or_else(|| anyhow::anyhow!("Failed to get operand string"))?)?;
                 }
@@ -660,8 +693,18 @@ impl TextSection {
                 let base_reg_name = cs.reg_name(base_reg)
                     .ok_or_else(|| anyhow::anyhow!("Failed to get register name for {:?}", base_reg))?;
                 if let Ok(target) = reference_target {
+                    let &section = parent.sections.get(target).expect("Reference target not in any section");
+                    match section {
+                        SectionType::Data | SectionType::Bss | SectionType::Rodata | SectionType::Text | SectionType::Embed => {
+                            writeln!(file, "\t{} {}, [{}, :lo12:{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, parent.get_symbol(target, helper)?)?;
+                        },
+                        SectionType::Got => {
+                            writeln!(file, "\t{} {}, [{}, :got_lo12:{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, parent.get_got_target_symbol(target, references, helper)?)?;
+                            //writeln!(file, "\t{} {}, [{}, :lo12:{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, parent.get_symbol(target, helper)?)?;
+                        },
+                        _ => bail!("Unhandled ldr/str target section type for instruction at 0x{:X}: {:?}", instr.address(), section),
+                    }
                     //println!("Reference found for memory operand at 0x{:X} to 0x{:X}", instr.address(), target);
-                    writeln!(file, "\t{} {}, [{}, :lo12:{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, parent.get_symbol(target, helper)?)?;
                 } else {
                     writeln!(file, "\t{} {}", mnemonic, instr.op_str().ok_or_else(|| anyhow::anyhow!("Failed to get operand string"))?)?;
                 }
