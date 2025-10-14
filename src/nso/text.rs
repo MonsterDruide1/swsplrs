@@ -576,9 +576,8 @@ impl TextSection {
         Ok(())
     }
 
-    pub fn export_object_asm(&self, obj: &Object, path: impl AsRef<Path>, references: &References, helper: &NsoLookupHelper, parent: &NSO) -> Result<()> {
+    pub fn export_object_asm(&self, obj: &Object, file: &mut File, references: &References, helper: &NsoLookupHelper, parent: &NSO) -> Result<()> {
         use std::io::Write;
-        let mut file = File::create(path)?;
         let cs = construct_capstone()?;
 
         let start = obj.text_section.iter().map(
@@ -601,7 +600,7 @@ impl TextSection {
                 writeln!(file, "{}:", parent.get_symbol(instr.address(), helper)?)?;
             }
 
-            self.disassemble_instruction(&instr, &mut file, &cs, references, helper, parent)?;
+            self.disassemble_instruction(&instr, file, &cs, references, helper, parent)?;
         }
 
         Ok(())

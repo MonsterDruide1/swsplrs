@@ -1,7 +1,8 @@
-use std::{collections::{BTreeMap, HashMap, HashSet}, fs::{self, File}, io::{Cursor, Seek}, path::Path, process::Command};
+use std::{collections::{BTreeMap, HashMap, HashSet}, fs::{self, File}, io::{Cursor, Seek, Write}, path::{Path, PathBuf}, process::Command};
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, ensure, Context, Result};
 use binrw::{binread, BinRead, BinReaderExt, NullString};
+use indexmap::IndexSet;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle, ProgressIterator};
 use num_enum::TryFromPrimitive;
 
@@ -286,13 +287,19 @@ impl NSO {
             Box::new(file_list.iter())
         };
 
+        let asm_path = path.join("asm");
+        let mut asm_files = Vec::new();
         for (name, obj) in iter {
+            if name == "UNKNOWN" { continue; }
             pb.as_ref().map(|p| p.set_message(format!("Exporting {}", name)));
-            let obj_path = path.join(name);
-            let obj_asm_path = obj_path.join("asm");
-            fs::create_dir_all(&obj_asm_path)?;
-            self.text.export_object_asm(&obj, obj_asm_path.join("text.s"), &references, &helper, &self)?;
-            // TODO: also export other sections, not just .text
+            // replace trailing `.o` with `.s` if exists, otherwise just append `.s`
+            let obj_name = if name.ends_with(".o") { name[..name.len()-2].to_owned() + ".s" } else { name.to_owned() + ".s" };
+            let obj_path = asm_path.join(obj_name);
+            fs::create_dir_all(obj_path.parent().expect("Failed to get parent directory"))?;
+            let mut file = File::create(&obj_path)?;
+            self.text.export_object_asm(&obj, &mut file, &references, &helper, &self)?;
+            self.export_referenced_data(&obj, &mut file, &references, &helper).context(format!("In file {}", obj_path.display()))?;
+            asm_files.push((name.clone(), obj_path));
         }
 
         let m = if no_progress { None } else {
@@ -300,23 +307,21 @@ impl NSO {
             Some(MultiProgress::new())
         };
         let pb = m.as_ref().map(|m|
-            m.add(ProgressBar::new(file_list.len() as u64))
+            m.add(ProgressBar::new(asm_files.len() as u64))
                 .with_prefix("   [1/1]")
                 .with_style(ProgressStyle::with_template("{prefix} {msg:35!} {wide_bar} {pos}/{len}  ").unwrap())
         );
-        let iter: Box<dyn Iterator<Item = &(String, Object)>> = if let Some(pb) = pb.clone() {
-            Box::new(file_list.iter().progress_with(pb))
+        let iter: Box<dyn Iterator<Item = (String, PathBuf)>> = if let Some(pb) = pb.clone() {
+            Box::new(asm_files.into_iter().progress_with(pb))
         } else {
-            Box::new(file_list.iter())
+            Box::new(asm_files.into_iter())
         };
 
-        for (name, _) in iter {
+        let obj_path = path.join("obj");
+        for (name, path) in iter {
             pb.as_ref().map(|p| p.set_message(name.clone()));
-            let obj_path = path.join(name);
-            let obj_asm_path = obj_path.join("asm");
-            let obj_name = if name.contains("/") { name.rsplit_once('/').unwrap().1.to_owned() } else { name.to_owned() };
-            self.assemble(obj_path.join(obj_name), vec![obj_asm_path.join("text.s")])?;
-            // TODO: also assemble other sections, not just .text
+            let obj_name = if name.ends_with(".o") { name } else { format!("{}.o", name) };
+            self.assemble(&obj_path.join(obj_name), vec![path])?;
         }
 
         Ok(())
@@ -1154,27 +1159,112 @@ impl NSO {
         Ok(())
     }
 
-    fn assemble(&self, output_path: impl AsRef<Path>, input_paths: Vec<impl AsRef<Path>>) -> anyhow::Result<()> {
+    fn export_referenced_data(&self, obj: &Object, file: &mut File, references: &References, helper: &NsoLookupHelper) -> Result<()> {
+        let text_start = obj.text_section.iter().map(
+            |info| info.offset as usize
+        ).min().ok_or_else(|| anyhow::anyhow!("Object has no text section entries"))?;
+        let text_end = obj.text_section.iter().map(
+            |info| (info.offset + info.size) as usize
+        ).max().ok_or_else(|| anyhow::anyhow!("Object has no text section entries"))?;
+
+        let mut unhandled_sources = Vec::new();
+        for addr in (text_start..text_end).step_by(4) {
+            unhandled_sources.push(addr as u64);
+        }
+
+        let mut refs = Vec::new();
+        while let Some(source) = unhandled_sources.pop() {
+            if let Some(target) = references.get_target_address(source) {
+                let Some(section) = self.sections.get(target) else {
+                    bail!("Referenced data at {:X} not in any section", target);
+                };
+                match section {
+                    SectionType::Rodata | SectionType::Data => {
+                        refs.push((source, target));
+                        unhandled_sources.push(target);
+                    }
+                    SectionType::Bss | SectionType::Embed => {
+                        refs.push((source, target));
+                    }
+                    SectionType::Plt | SectionType::Text => continue,    // ignore, just used to properly resolve calls
+                    SectionType::Got | SectionType::GotPlt => continue,  // imported from other objects or libraries
+                    _ => {
+                        bail!("Unhandled referenced data in section {:?} at {:X}", section, target);
+                    }
+                }
+            }
+        }
+
+        refs.sort_by_cached_key(|(s, _)| *s);
+        let mut chunks = HashMap::new();
+        for (_, target) in refs.into_iter() {
+            chunks.entry(self.sections.get(target).expect("Target address not in any section")).or_insert_with(IndexSet::new).insert(target);
+        }
+
+        for (section, chunk) in &chunks {
+            let end_of_section = self.sections.get_range(section).expect("Section does not exist").end;
+            match section {
+                SectionType::Rodata | SectionType::Data | SectionType::Bss | SectionType::Embed => {
+                    let section_name = match section {
+                        SectionType::Rodata => ".rodata",
+                        SectionType::Data => ".data",
+                        SectionType::Bss => ".bss",
+                        SectionType::Embed => ".embed",
+                        _ => unreachable!()
+                    };
+                    writeln!(file, "")?;
+                    writeln!(file, "")?;
+                    writeln!(file, ".section {}, \"a\"", section_name)?;
+                    writeln!(file, "")?;
+                    for &target in chunk {
+                        let end_of_target = (target + 1..end_of_section).find(|t| references.has_references_to(*t)).unwrap_or(end_of_section);
+
+                        let symbol = self.get_symbol(target, helper)?;
+                        writeln!(file, "{}:", symbol)?;
+                        for t in target..end_of_target {
+                            match section {
+                                SectionType::Bss => writeln!(file, "\t.skip 1")?,
+                                SectionType::Rodata | SectionType::Data | SectionType::Embed => writeln!(file, "\t.byte 0x{:02X}", self.file.memory[t as usize])?,
+                                _ => unreachable!()
+                            }
+                        }
+                        writeln!(file, "")?;
+                    }
+                }
+                SectionType::Plt | SectionType::Text => {}    // ignore, just used to properly resolve calls
+                SectionType::Got | SectionType::GotPlt => {}  // imported from other objects or libraries
+                _ => {
+                    bail!("Unhandled referenced data in section {:?}: {:?}", section, chunk);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn assemble(&self, output_path: &PathBuf, input_paths: Vec<impl AsRef<Path>>) -> anyhow::Result<()> {
+        fs::create_dir_all(output_path.parent().expect("Output path has no parent"))?;
+
         let mut cmd = Command::new("aarch64-linux-gnu-as");
-        cmd.arg("-o").arg(output_path.as_ref());
+        cmd.arg("-o").arg(output_path);
         for input in input_paths {
             cmd.arg(input.as_ref());
         }
         let output = cmd.output()?;
         ensure!(output.status.success(), 
             "Failed to assemble {}: {}\n{}",
-            output_path.as_ref().display(),
+            output_path.display(),
             String::from_utf8_lossy(&output.stderr),
             String::from_utf8_lossy(&output.stdout)
         );
         
         let mut cmd = Command::new("aarch64-linux-gnu-strip");
         cmd.arg("-x");
-        cmd.arg(output_path.as_ref());
+        cmd.arg(output_path);
         let output = cmd.output()?;
         ensure!(output.status.success(), 
             "Failed to strip {}: {}\n{}",
-            output_path.as_ref().display(),
+            output_path.display(),
             String::from_utf8_lossy(&output.stderr),
             String::from_utf8_lossy(&output.stdout)
         );

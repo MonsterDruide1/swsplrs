@@ -77,7 +77,7 @@ impl SectionMap {
 
 // list/order from https://github.com/h1k421/GLoat/blob/master/libgloat/application.ld
 // with slight adjustments based on nxo64.py, swspl and SMO's segment order
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SectionType {
     Crt0,
     Text,

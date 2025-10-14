@@ -7,10 +7,9 @@ use crate::file_list::Object;
 pub fn write_config(path: PathBuf, file_list: &Vec<(String, Object)>) -> anyhow::Result<()> {
     // TODO: read all config options everywhere and configure "properly"
     let units = file_list.iter().map(|(name, _)| {
-        let obj_name = if name.contains("/") { name.rsplit_once('/').unwrap().1.to_owned() } else { name.to_owned() };
         ProjectObject {
             name: Some(name.clone()),
-            target_path: Some(format!("out/split/{}/{}", name, obj_name).into()),
+            target_path: Some(format!("out/split/obj/{}", name).into()),
             base_path: Some(format!("build/CMakeFiles/odyssey.dir/lib/al/{}", name.replace(".o", ".cpp.obj")).into()),
             ..Default::default()
         }

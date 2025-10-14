@@ -662,6 +662,7 @@ dependencies = [
  "binrw",
  "capstone",
  "gimli",
+ "indexmap",
  "indicatif",
  "lz4_flex",
  "num_enum",
