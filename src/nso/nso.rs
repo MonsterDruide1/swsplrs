@@ -1245,7 +1245,7 @@ impl NSO {
     fn assemble(&self, output_path: &PathBuf, input_paths: Vec<impl AsRef<Path>>) -> anyhow::Result<()> {
         fs::create_dir_all(output_path.parent().expect("Output path has no parent"))?;
 
-        let mut cmd = Command::new("aarch64-linux-gnu-as");
+        let mut cmd = Command::new("aarch64-unknown-linux-gnu-as");
         cmd.arg("-o").arg(output_path);
         for input in input_paths {
             cmd.arg(input.as_ref());
@@ -1258,7 +1258,7 @@ impl NSO {
             String::from_utf8_lossy(&output.stdout)
         );
         
-        let mut cmd = Command::new("aarch64-linux-gnu-strip");
+        let mut cmd = Command::new("aarch64-unknown-linux-gnu-strip");
         cmd.arg("-x");
         cmd.arg(output_path);
         let output = cmd.output()?;
