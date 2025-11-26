@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, HashMap, HashSet}, fs::{self, File}, io::{Cursor, Seek, Write}, path::{Path, PathBuf}, process::Command};
+use std::{collections::{BTreeMap, HashMap, HashSet, VecDeque}, fs::{self, File}, io::{Cursor, Seek, Write}, path::{Path, PathBuf}, process::Command};
 
 use anyhow::{bail, ensure, Context, Result};
 use binrw::{binread, BinRead, BinReaderExt, NullString};
@@ -1167,13 +1167,19 @@ impl NSO {
             |info| (info.offset + info.size) as usize
         ).max().ok_or_else(|| anyhow::anyhow!("Object has no text section entries"))?;
 
-        let mut unhandled_sources = Vec::new();
+        let mut unhandled_sources = VecDeque::new();
         for addr in (text_start..text_end).step_by(4) {
-            unhandled_sources.push(addr as u64);
+            unhandled_sources.push_back(addr as u64);
         }
 
         let mut refs = Vec::new();
-        while let Some(source) = unhandled_sources.pop() {
+        let mut handled_sources = HashSet::new();
+        while let Some(source) = unhandled_sources.pop_front() {
+            if handled_sources.contains(&source) {
+                continue;
+            }
+            handled_sources.insert(source);
+
             if let Some(target) = references.get_target_address(source) {
                 let Some(section) = self.sections.get(target) else {
                     bail!("Referenced data at {:X} not in any section", target);
@@ -1181,15 +1187,25 @@ impl NSO {
                 match section {
                     SectionType::Rodata | SectionType::Data => {
                         refs.push((source, target));
-                        unhandled_sources.push(target);
+                        unhandled_sources.push_back(target);
+                        // TODO: potentially add more references, as data is not necessarily only one entry (example: vtable/typeinfo/...)
                     }
                     SectionType::Bss | SectionType::Embed => {
                         refs.push((source, target));
                     }
+                    SectionType::Got => {
+                        unhandled_sources.push_back(target);
+                    }
+                    SectionType::Dynsym => {
+                        ensure!(self.sections.get(source) == Some(&SectionType::Got),
+                            "Reference from {:?} at {:X} to dynsym at {:X} unexpected",
+                            self.sections.get(source), source, target
+                        );
+                    }
                     SectionType::Plt | SectionType::Text => continue,    // ignore, just used to properly resolve calls
-                    SectionType::Got | SectionType::GotPlt => continue,  // imported from other objects or libraries
+                    SectionType::GotPlt => continue,  // imported from other objects or libraries
                     _ => {
-                        bail!("Unhandled referenced data in section {:?} at {:X}", section, target);
+                        bail!("Unhandled referenced data while collecting in section {:?} at {:X}", section, target);
                     }
                 }
             }
@@ -1234,7 +1250,7 @@ impl NSO {
                 SectionType::Plt | SectionType::Text => {}    // ignore, just used to properly resolve calls
                 SectionType::Got | SectionType::GotPlt => {}  // imported from other objects or libraries
                 _ => {
-                    bail!("Unhandled referenced data in section {:?}: {:?}", section, chunk);
+                    bail!("Unhandled referenced data while exporting in section {:?}: {:?}", section, chunk);
                 }
             }
         }
@@ -1245,7 +1261,7 @@ impl NSO {
     fn assemble(&self, output_path: &PathBuf, input_paths: Vec<impl AsRef<Path>>) -> anyhow::Result<()> {
         fs::create_dir_all(output_path.parent().expect("Output path has no parent"))?;
 
-        let mut cmd = Command::new("aarch64-unknown-linux-gnu-as");
+        let mut cmd = Command::new("aarch64-linux-gnu-as");
         cmd.arg("-o").arg(output_path);
         for input in input_paths {
             cmd.arg(input.as_ref());
@@ -1258,7 +1274,7 @@ impl NSO {
             String::from_utf8_lossy(&output.stdout)
         );
         
-        let mut cmd = Command::new("aarch64-unknown-linux-gnu-strip");
+        let mut cmd = Command::new("aarch64-linux-gnu-strip");
         cmd.arg("-x");
         cmd.arg(output_path);
         let output = cmd.output()?;
