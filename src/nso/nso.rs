@@ -973,6 +973,18 @@ impl NSO {
         writeln!(file, "off_{:X}:", dynamic)?;
         writeln!(file, "\t.quad 0")?;
 
+        // got_plt_start
+        let got_plt_start = Self::get_dynamic_tag_value(&self.dynamic_segment, DynamicTagType::DT_PLTGOT)? as u64;
+        writeln!(file, ".global off_{:X}", got_plt_start)?;
+        writeln!(file, "off_{:X}:", got_plt_start)?;
+        writeln!(file, "\t.quad 0")?;
+
+        // plt_start
+        let plt_start = self.text.section_offset + self.text.section.len();
+        writeln!(file, ".global loc_{:X}", plt_start)?;
+        writeln!(file, "loc_{:X}:", plt_start)?;
+        writeln!(file, "\t.quad 0")?;
+
         Ok(())
     }
 
@@ -1395,7 +1407,8 @@ pub enum DynamicTagType {
     DT_MOVETAB = 0x6ffffefe,
     DT_SYMINFO = 0x6ffffeff,
     DT_RELACOUNT = 0x6ffffff9,
-    DT_RELCOUNT = 0x6ffffffa
+    DT_RELCOUNT = 0x6ffffffa,
+    DT_FLAGS_1 = 0x6ffffffb,
 }
 
 #[binread]
@@ -1411,6 +1424,7 @@ pub struct Relocation {
 #[br(repr = u32)]
 #[allow(non_camel_case_types)]
 pub enum RelocationType {
+    R_TYPE_UNKNOWN = 0,
     R_AARCH64_COPY = 1024,
     R_AARCH64_GLOB_DAT = 1025,
     R_AARCH64_JUMP_SLOT = 1026,
