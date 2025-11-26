@@ -13,8 +13,8 @@ PHDRS
 
 SECTIONS
 {
+  . = 0x0;
   PROVIDE(__start__ = 0x0);
-  . = __start__;
   __code_start__ = .;
 
   /* App code */
@@ -27,6 +27,7 @@ SECTIONS
   } :text
 
   /* Trampoline and stuffs */
+  __plt_start__ = .;
   .plt : { *(.plt .plt.*) } :text
   __code_end__ = .;
 
@@ -38,21 +39,21 @@ SECTIONS
   
   . = ALIGN(8);
 
-  __rel_dyn_start__ = .;
+  __rel_dyn_start = .;
   .rel.dyn : { *(.rel.dyn) } :rodata
-  __rel_dyn_end__ = .;
+  __rel_dyn_end = .;
 
-  __rela_dyn_start__ = .;
+  __rela_dyn_start = .;
   .rela.dyn : { *(.rela.dyn) } :rodata
-  __rela_dyn_end__ = .;
+  __rela_dyn_end = .;
 
-  __rel_plt_start__ = .;
+  __rel_plt_start = .;
   .rel.plt        : { *(.rel.plt) } :rodata
-  __rel_plt_end__ = .;
+  __rel_plt_end = .;
 
-  __rela_plt_start__ = .;
+  __rela_plt_start = .;
   .rela.plt       : { *(.rela.plt) } :rodata
-  __rela_plt_end__ = .;
+  __rela_plt_end = .;
 
   /* All the symbols needed for relocation lookup */
   .hash     : { *(.hash) } :rodata

@@ -229,7 +229,6 @@ impl NSO {
             (".got.plt", Box::new(|(_,_)| self.export_got_plt(path.join("got.plt.s")))),
             (".got", Box::new(|(_,_)| self.export_got(path.join("got.s"), &helper))),
             (".init_array", Box::new(|(r,_)| self.export_init_array(path.join("init_array.s"), r, &helper))),
-            ("section_start_labels", Box::new(|(_,_)| self.export_section_start_labels(path.join("section_start_labels.s")))),
             ("crt0", Box::new(|(_,_)| self.export_crt0(path.join("crt0.s")))),
             ("unknown data gap", Box::new(|(_,_)| self.export_unknown_data_gap(path.join("unknown_data_gap.s")))),
             (".eh_frame", Box::new(|(_,_)| self.export_eh_frame(path.join("eh_frame.s")))),
@@ -334,6 +333,38 @@ impl NSO {
                 bail!("Symbol at {:X} has no name", address);
             };
             return Ok(name.clone());
+        }
+        // special case for section start/end addresses (used by _init and _fini)
+        if let Some(plt_range) = self.sections.get_range(&SectionType::Plt) && address == plt_range.start {
+            return Ok("__plt_start__".to_string());
+        }
+        if let Some(got_plt_range) = self.sections.get_range(&SectionType::GotPlt) && address == got_plt_range.start {
+            return Ok("__got_start__".to_string());
+        }
+        if let Some(dynamic_range) = self.sections.get_range(&SectionType::Dynamic) && address == dynamic_range.start {
+            return Ok("__dynamic_start__".to_string());
+        }
+        if let Some(rela_plt_range) = self.sections.get_range(&SectionType::RelaPlt) {
+            if rela_plt_range.start == address {
+                return Ok("__rela_plt_start".to_string());
+            }
+            if rela_plt_range.end == address {
+                return Ok("__rela_plt_end".to_string());
+            }
+        }
+        if let Some(rela_dyn_range) = self.sections.get_range(&SectionType::RelaDyn) {
+            if rela_dyn_range.start == address {
+                return Ok("__rela_dyn_start".to_string());
+            }
+            if rela_dyn_range.end == address {
+                return Ok("__rela_dyn_end".to_string());
+            }
+        }
+        if let Some(init_array_range) = self.sections.get_range(&SectionType::InitArray) && address == init_array_range.end {
+            // TODO: figure out how to handle tdata/tbss symbols, which these *actually* mark - not just the end of .init_array
+            //  tdata_start, tdata_end, tdata_align_rel,
+            //  tbss_start,  tbss_end,  tbss_align_rel
+            return Ok("__tdata_start__".to_string());
         }
         // otherwise use `loc_X` for .text or `off_X` for .data/.rodata/.bss
         let prefix = if self.file.is_address_in_segment(address, &NsoSegment::Text) {
@@ -929,62 +960,6 @@ impl NSO {
         use std::io::Write;
         let mut file = File::create(path)?;
         writeln!(file, "{}", CRT0)?;
-        Ok(())
-    }
-
-    // FIXME: figure out how to properly generate these labels
-    fn export_section_start_labels(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
-        // names from https://github.com/shinyquagsire23/switch-oss/blob/171a7426a95def81c4abf038730130f9e13c6788/src/rocrt_nro.cpp#L116
-        use std::io::Write;
-        let mut file = File::create(path)?;
-        writeln!(file, ".section \".section_start_labels\"")?;
-        writeln!(file, "")?;
-
-        //  tdata_start, tdata_end, tdata_align_rel,
-        //  tbss_start,  tbss_end,  tbss_align_rel
-        let tdata_tbss = self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64 + self.file.header.get_segment_mem_size(&NsoSegment::Data) as u64;
-        writeln!(file, ".global off_{:X}", tdata_tbss)?;
-        writeln!(file, "off_{:X}:", tdata_tbss)?;
-        writeln!(file, "\t.quad 0")?;
-
-        // rela_dyn_start
-        let rela_dyn_start = Self::get_dynamic_tag_value(&self.dynamic_segment, DynamicTagType::DT_RELA)?;
-        writeln!(file, ".global off_{:X}", rela_dyn_start)?;
-        writeln!(file, "off_{:X}:", rela_dyn_start)?;
-        writeln!(file, "\t.quad 0")?;
-
-        // rela_dyn_end / rela_plt_start
-        let rela_plt_start = Self::get_dynamic_tag_value(&self.dynamic_segment, DynamicTagType::DT_RELA)? +
-            Self::get_dynamic_tag_value(&self.dynamic_segment, DynamicTagType::DT_RELASZ)?;
-        writeln!(file, ".global off_{:X}", rela_plt_start)?;
-        writeln!(file, "off_{:X}:", rela_plt_start)?;
-        writeln!(file, "\t.quad 0")?;
-
-        // rela_plt_end
-        let rela_plt_end = Self::get_dynamic_tag_value(&self.dynamic_segment, DynamicTagType::DT_JMPREL)? +
-            Self::get_dynamic_tag_value(&self.dynamic_segment, DynamicTagType::DT_PLTRELSZ)?;
-        writeln!(file, ".global off_{:X}", rela_plt_end)?;
-        writeln!(file, "off_{:X}:", rela_plt_end)?;
-        writeln!(file, "\t.quad 0")?;
-
-        // DYNAMIC
-        let dynamic = (self.module.header_offset + self.module.dyn_offset) as usize;
-        writeln!(file, ".global off_{:X}", dynamic)?;
-        writeln!(file, "off_{:X}:", dynamic)?;
-        writeln!(file, "\t.quad 0")?;
-
-        // got_plt_start
-        let got_plt_start = Self::get_dynamic_tag_value(&self.dynamic_segment, DynamicTagType::DT_PLTGOT)? as u64;
-        writeln!(file, ".global off_{:X}", got_plt_start)?;
-        writeln!(file, "off_{:X}:", got_plt_start)?;
-        writeln!(file, "\t.quad 0")?;
-
-        // plt_start
-        let plt_start = self.text.section_offset + self.text.section.len();
-        writeln!(file, ".global loc_{:X}", plt_start)?;
-        writeln!(file, "loc_{:X}:", plt_start)?;
-        writeln!(file, "\t.quad 0")?;
-
         Ok(())
     }
 
