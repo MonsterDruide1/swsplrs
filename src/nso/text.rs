@@ -149,14 +149,33 @@ impl TextSection {
             has_been_used: bool,  // has been used for *something* (add, ldr, str) => used to detect unused ADRPs
             is_added: bool,       // has this adrp been combined with an add instruction yet? => used to remove ldr/str with conflicting targets
         }
+        // Jump tables are always used/detected as follows:
+        // Xt = table_register (address of table), Xj = jump_register (loaded target), Xm = index register
+        //  ADRP Xt, #jump_table@PAGE
+        //  ADD Xt, Xt, #jump_table@PAGEOFF
+        //  LDRSW Xj, [Xt, Xm, LSL #2]
+        //  ADD Xj, Xj, Xt
+        //  BR Xj
+        // TODO: currently only detects within a single basic block
+        #[derive(Debug, Clone)]
+        struct JumpTableDetectState {
+            table_register: capstone::RegId,
+            is_safe: bool,    // to avoid deleting when jump_register or table_register is written to by intended instruction
+            table_offset: u64,
+            jump_register: Option<capstone::RegId>,  // to be filled in when LDRSW is found
+            is_added: bool,
+        }
         #[derive(Debug, Clone)]
         struct BasicBlock {
             next_blocks: Vec<u64>,
             adrp_targets_at_end: HashMap<capstone::RegId, AdrpInfo>,
             destroyed_regs: HashSet<capstone::RegId>,  // 64-bit integer registers (X0-X30) that have been overwritten in this block
             potential_refs: Vec<PotentialRef>,
+            jump_table_state: Vec<JumpTableDetectState>,
         }
         let mut blocks = RangeMap::<u64, BasicBlock>::new();
+
+        // TODO: jump table references do not split basic blocks, as those are only detected after all other references are created
         
         // discovery: find and separate basic blocks, collect code references
         {
@@ -172,6 +191,7 @@ impl TextSection {
                     adrp_targets_at_end: HashMap::new(),
                     destroyed_regs: HashSet::new(),
                     potential_refs: Vec::new(),
+                    jump_table_state: Vec::new(),
                 });
                 current_start = end;
             };
@@ -253,6 +273,7 @@ impl TextSection {
                         adrp_targets_at_end: HashMap::new(),
                         destroyed_regs: HashSet::new(),
                         potential_refs: Vec::new(),
+                        jump_table_state: Vec::new(),
                     });
                 }
             }
@@ -265,11 +286,14 @@ impl TextSection {
 
         // local analysis: analyze basic blocks
         {
-            let handle_potential_ref = |block: &mut BasicBlock, src_reg: RegId, offset: i64, source_type: ReferenceSource, source_offset: u64, ref_type: DataRefType, reference_tracker: &mut ReferenceTracker| -> Result<()> {
+            let handle_potential_ref = |block: &mut BasicBlock, src_reg: RegId, offset: i64, source_type: ReferenceSource, source_offset: u64, ref_type: DataRefType, reference_tracker: &mut ReferenceTracker| -> Result<Option<u64>> {
                 if let Some(adrp) = block.adrp_targets_at_end.get_mut(&src_reg) {
-                    reference_tracker.add_reference(((adrp.target as i64) + offset) as u64, source_type, source_offset, ref_type);
-                    reference_tracker.add_reference(((adrp.target as i64) + offset) as u64, ReferenceSource::ADRP, adrp.location, ref_type);
+                    let target = ((adrp.target as i64) + offset) as u64;
+                    reference_tracker.add_reference(target, source_type, source_offset, ref_type);
+                    reference_tracker.add_reference(target, ReferenceSource::ADRP, adrp.location, ref_type);
                     adrp.has_been_used = true;  // mark as used within this block
+
+                    Ok(Some(target))
                 } else if !block.destroyed_regs.contains(&src_reg) {
                     block.potential_refs.push(PotentialRef {
                         register: src_reg,
@@ -278,8 +302,11 @@ impl TextSection {
                         source_offset,
                         ref_type,
                     });
-                }  // else: base register has been re-assigned to "useless" value within this block => ignore
-                Ok(())
+                    Ok(None)
+                } else {
+                    // base register has been re-assigned to "useless" value within this block => ignore
+                    Ok(None)
+                }
             };
 
             let mut iter = cs.disasm_iter(&self.section, self.section_offset as u64)
@@ -328,7 +355,59 @@ impl TextSection {
                         // x0-x17 are scratch registers => destroyed by function call
                         new_destroyed_regs.extend((Arm64Reg::ARM64_REG_X0..=Arm64Reg::ARM64_REG_X17).map(|r| RegId(r as u16)));
                     }
-                    "br" | "b" | "tbz" | "tbnz" | "cbz" | "cbnz" | "ret" => {
+                    "br" => {
+                        ensure!(instr.address() + 4 == range.end, "Block end does not match instruction end: branch at 0x{:X}, block spans 0x{:X}-0x{:X}", instr.address(), range.start, range.end);
+                        // check for jump table
+                        let target_reg = get_operand_reg(&detail, 0)?;
+                        for jt in current_block.jump_table_state.iter_mut() {
+                            if jt.is_added && jt.jump_register == Some(target_reg) {
+                                // FIXME: hardcoded, broken ones from SMO
+                                let jmp_table_size = if instr.address() == 0x627AC4 {
+                                    6
+                                } else if instr.address() == 0x693464 {
+                                    6
+                                } else if instr.address() == 0x75F82C {
+                                    5
+                                } else if instr.address() == 0x760B18 {
+                                    5
+                                } else if instr.address() == 0x760C80 {
+                                    5
+                                } else if instr.address() == 0x7B59E8 {
+                                    5
+                                } else if instr.address() == 0xA60D20 {
+                                    6
+                                } else if instr.address() == 0xB3A9A4 {
+                                    6
+                                } else if instr.address() == 0xB3BA10 {
+                                    6
+                                } else if instr.address() == 0xB3C8DC {
+                                    6
+                                } else if instr.address() == 0xB3D85C {
+                                    6
+                                } else if instr.address() == 0xB3E8D4 {
+                                    6
+                                } else if instr.address() == 0xB88C1C {
+                                    6
+                                }
+                                else {
+                                    // FIXME: this is quite hacky, assuming a lot of things
+                                    // for example, we assume the last cmp before the branch is the one setting up the jump table size
+                                    // also, assume that branches are 0-indexed
+                                    const NUM_LOOKBEHIND: u64 = 15;
+                                    let local_disasm = cs.disasm_count(&self.section[(instr.address() - NUM_LOOKBEHIND * 4) as usize  - self.section_offset..], instr.address() - NUM_LOOKBEHIND * 4, NUM_LOOKBEHIND as usize)?;
+                                    let last_cmp = local_disasm.iter().rev().find(|i| i.mnemonic().unwrap_or("") == "cmp");
+                                    ensure!(last_cmp.is_some(), "Failed to find cmp instruction before jump table branch at 0x{:X}", instr.address());
+                                    let last_cmp = last_cmp.unwrap();
+                                    let cmp_detail = cs.insn_detail(&last_cmp)
+                                        .or_else(|e| bail!("Failed to get instruction detail: {}", e))?;
+
+                                    get_operand_imm(&cmp_detail, 1)? + 1
+                                };
+                                reference_tracker.add_reference(jt.table_offset, ReferenceSource::JumpTableUsage, instr.address(), DataRefType::JumpTable(jmp_table_size));
+                            }
+                        }
+                    }
+                    "b" | "tbz" | "tbnz" | "cbz" | "cbnz" | "ret" => {
                         ensure!(instr.address() + 4 == range.end, "Block end does not match instruction end: branch at 0x{:X}, block spans 0x{:X}-0x{:X}", instr.address(), range.start, range.end);
                     }
                     s if s.starts_with("b.") => {  // conditionals with b (b.eq, b.ne, b.lt, ...)
@@ -351,7 +430,8 @@ impl TextSection {
                         // we are only interested in adds with last operand being an immediate (=> offset)
                         if let Ok(offset) = get_operand_imm(&detail, 2) {
                             let src_reg = get_operand_reg(&detail, 1)?;
-                            handle_potential_ref(
+                            let target_reg = get_operand_reg(&detail, 0)?;
+                            let target = handle_potential_ref(
                                 current_block,
                                 src_reg,
                                 offset as i64,
@@ -360,6 +440,15 @@ impl TextSection {
                                 DataRefType::Unknown,
                                 &mut reference_tracker
                             )?;
+                            if let Some(target) = target {
+                                current_block.jump_table_state.push(JumpTableDetectState {
+                                    table_register: target_reg,
+                                    is_safe: true,
+                                    table_offset: target,
+                                    jump_register: None,
+                                    is_added: false,
+                                });
+                            }
                             // for something like `add x22, x23, #20` and `x23` being an adrp target, adjust target of adrp
                             // TODO: this causes X8 = ADRP:hi(target) ; X8 += lo(target) ; X8 += lo(other), which is not valid
                             // potential fix: generate `add x8, x8, other-target` for second add
@@ -372,11 +461,26 @@ impl TextSection {
                                 }));
                             }*/
                         }
+
+                        // check for jump table
+                        if let Ok(out) = get_operand_reg(&detail, 0) && let Ok(in1) = get_operand_reg(&detail, 1) && let Ok(in2) = get_operand_reg(&detail, 2) {
+                            for jt in current_block.jump_table_state.iter_mut() {
+                                if jt.jump_register == Some(out) && jt.jump_register == Some(in1) && jt.table_register == in2 {
+                                    ensure!(!jt.is_added, "Jump table add detected multiple times in block at 0x{:X}-0x{:X}", range.start, range.end);
+                                    jt.is_added = true;
+                                    jt.is_safe = true;
+                                }
+                            }
+                        }
                     }
-                    "ldr" | "str" | "ldrh" | "strh" | "ldrb" | "strb" | "ldrsh" => {
+                    "ldr" | "str" | "ldrh" | "strh" | "ldrb" | "strb" | "ldrsh" | "ldrsw" => {
                         let target_reg_type = get_reg_type(get_operand_reg(&detail, 0)?, &cs)?;
                         let target_type = match mnemonic {
                             "ldr" | "str" => target_reg_type,
+                            "ldrsw" => {
+                                ensure!(target_reg_type == DataRefType::Int32 || target_reg_type == DataRefType::Int64, "Unexpected register type for {}: {:?}", mnemonic, target_reg_type);
+                                DataRefType::Int32
+                            }
                             "ldrh" | "strh" | "ldrsh" => {
                                 ensure!(target_reg_type == DataRefType::Int32 || target_reg_type == DataRefType::Int64, "Unexpected register type for {}: {:?}", mnemonic, target_reg_type);
                                 DataRefType::Int16
@@ -397,6 +501,16 @@ impl TextSection {
                             target_type,
                             &mut reference_tracker
                         )?;
+
+                        // check for jump table
+                        if mnemonic == "ldrsw" && instr.op_str().is_some_and(|s| s.ends_with("lsl #2]")) {
+                            for jt in current_block.jump_table_state.iter_mut() {
+                                if jt.table_register == src_reg {
+                                    ensure!(!jt.is_added && jt.jump_register.is_none(), "Jump table load detected multiple times in block at 0x{:X}-0x{:X}", range.start, range.end);
+                                    jt.jump_register = Some(get_operand_reg(&detail, 0)?);
+                                }
+                            }
+                        }
                     }
                     _ => {
                         ensure!(
@@ -417,6 +531,18 @@ impl TextSection {
                 if let Some((reg, target)) = new_adrp_target {
                     current_block.adrp_targets_at_end.insert(reg, target);
                 }
+                // also, drop jump table states with destroyed registers
+                current_block.jump_table_state.retain_mut(|jt| {
+                    if jt.is_safe {
+                        jt.is_safe = false;
+                        return true;
+                    }
+                    if !jt.is_added {
+                        !new_destroyed_regs.contains(&jt.table_register)
+                    } else {
+                        !new_destroyed_regs.contains(&jt.jump_register.unwrap())
+                    }
+                });
             }
 
             if let Some(pb) = pb {
@@ -687,7 +813,7 @@ impl TextSection {
                     writeln!(file, "\t{} {}", mnemonic, instr.op_str().ok_or_else(|| anyhow::anyhow!("Failed to get operand string"))?)?;
                 }
             }
-            "ldr" | "str" | "ldrh" | "strh" | "ldrb" | "strb" | "ldrsh" => {
+            "ldr" | "str" | "ldrh" | "strh" | "ldrb" | "strb" | "ldrsh" | "ldrsw" => {
                 let base_reg = get_operand_mem(&detail, 1)?.base();
                 let base_reg_name = cs.reg_name(base_reg)
                     .ok_or_else(|| anyhow::anyhow!("Failed to get register name for {:?}", base_reg))?;

@@ -4,9 +4,10 @@ use anyhow::{Result, ensure};
 // top/low = most specific. If conflicts are found, the lower value (more specific) is used.
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub enum DataRefType {
-    Object(u64),   // size in bytes
-    Function(u64), // size in bytes
+    Object(u64),     // size in bytes
+    Function(u64),   // size in bytes
     Code,
+    JumpTable(u64),  // size in entries
     Float8,
     Int8,
     Float16,
@@ -30,8 +31,11 @@ pub enum ReferenceSource {
     Symbol,
     Relocation,    // offset of relocation
     InitArray,     // index of init_array entry
+    JumpTableUsage,// set of instructions to load/use jump table
+    JumpTable,     // jump table entry 
 }
 
+#[derive(Debug)]
 pub struct Reference {
     pub source: u64,
     pub source_type: ReferenceSource,
@@ -50,6 +54,10 @@ impl ReferenceTracker {
 
     pub fn add_reference(&mut self, target: u64, source_type: ReferenceSource, source: u64, target_type: DataRefType) {
         self.references.push(Reference {source, source_type, target, target_type});
+    }
+
+    pub fn get_jumptable_references(&self) -> Vec<&Reference> {
+        self.references.iter().filter(|r| matches!(r.target_type, DataRefType::JumpTable(_))).collect()
     }
 
     pub fn finalize(self) -> Result<References> {

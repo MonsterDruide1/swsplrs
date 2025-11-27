@@ -630,6 +630,8 @@ impl NSO {
             call_with_progress(&m, name, i+1, total_collect_references, f, (&mut reference_tracker, &m))?;
         }
 
+        self.collect_jumptable_references(&mut reference_tracker)?;
+
         Ok(reference_tracker.finalize()?)
     }
 
@@ -694,6 +696,29 @@ impl NSO {
         for (i, &func) in array.iter().enumerate() {
             let offset = offset + i as u64*8;
             reference_tracker.add_reference(func, ReferenceSource::InitArray, offset, DataRefType::Code);
+        }
+        Ok(())
+    }
+
+    fn collect_jumptable_references(&self, reference_tracker: &mut ReferenceTracker) -> anyhow::Result<()> {
+        let jumptable_refs: Vec<(u64, u64)> = reference_tracker
+            .get_jumptable_references()
+            .into_iter()
+            .map(|r| {
+                let DataRefType::JumpTable(size) = r.target_type else {
+                    panic!("Reference {:?} is not a jumptable reference", r);
+                };
+                (r.target, size)
+            })
+            .collect();
+
+        for (jt_target, jt_size) in jumptable_refs {
+            let cursor = &mut Cursor::new(&self.file.memory[jt_target as usize ..]);
+            for i in 0..jt_size {
+                let offset = cursor.read_le::<i32>()?;
+                let target = (jt_target as i64 + offset as i64) as u64;
+                reference_tracker.add_reference(target, ReferenceSource::JumpTable, jt_target + i*4, DataRefType::Code);
+            }
         }
         Ok(())
     }
@@ -888,6 +913,23 @@ impl NSO {
                             bail!("Symbol at index {:X} has no name", target);
                         };
                         writeln!(file, "\t.quad {}+{}", name, addend)?;
+                    }
+                    Some(DataRefType::Code) => {
+                        if let Some(data_type) = references.get_type_of(data_entry_offset) && let DataRefType::JumpTable(size) = data_type {
+                            for _ in 0..size {
+                                let offset = cursor.read_le::<i32>()?;
+                                let target = (data_entry_offset as i64 + offset as i64) as u64;
+                                writeln!(file, "\t.word {} - {}", self.get_symbol(target, helper)?, self.get_symbol(data_entry_offset, helper)?)?;
+                            }
+                        } else {
+                            let data = cursor.read_le::<u64>()?;
+                            ensure!(data == target, "Reference at {:X} points to {:X}, but data is {:X}", data_entry_offset, target, data);
+                            // references are either objects (by symbols), unknown (by references) or int64 (by 64-bit loads)
+                            ensure!(references.get_type_of(data_entry_offset).is_none_or(|x| matches!(x, DataRefType::Object(_) | DataRefType::Unknown | DataRefType::Int64)),
+                                "Reference at {:X} points to {:X}, but is not marked as object. Instead: {:?}", data_entry_offset, target, references.get_type_of(data_entry_offset)
+                            );
+                            writeln!(file, "\t.quad {}", self.get_symbol(target, helper)?)?;
+                        }
                     }
                     Some(_) => {
                         let data = cursor.read_le::<u64>()?;
