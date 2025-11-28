@@ -28,7 +28,7 @@
                     "value": "/home/monsterdruide1/.cargo/bin"
                 }
             ],
-            "args": ["~/smo-main-1.0-compressed.nso", "--export-all"],
+            "args": ["~/smo-main-1.0-compressed.nso", "--export-all", "--game", "smo"],
             "sourceFileMap": {},
             "osx": {
                 "MIMode": "lldb"

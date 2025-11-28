@@ -7,7 +7,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle, ProgressIterator};
 use num_enum::TryFromPrimitive;
 
 use crate::{
-    file_list::Object, nso::{nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}, section_map::{SectionMap, SectionType}, text::TextSection}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}, utils::call_with_progress
+    file_list::Object, hacks::hacks::Hacks, nso::{nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}, section_map::{SectionMap, SectionType}, text::TextSection}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}, utils::call_with_progress
 };
 
 pub struct NSO {
@@ -215,13 +215,13 @@ impl NSO {
         })
     }
 
-    pub fn export_all(&self, path: &Path, no_progress: bool) -> anyhow::Result<()> {
+    pub fn export_all(&self, path: &Path, hacks: &dyn Hacks, no_progress: bool) -> anyhow::Result<()> {
         let m = if no_progress { None } else {
             println!(" Step 1 / 2: Collecting references...");
             Some(MultiProgress::new())
         };
 
-        let references = self.get_references(m)?;
+        let references = self.get_references(hacks, m)?;
         let helper = NsoLookupHelper::new(self)?;
         fs::create_dir_all(path)?;
 
@@ -261,13 +261,13 @@ impl NSO {
         Ok(())
     }
 
-    pub fn split(&self, file_list: &Vec<(String, Object)>, path: &Path, no_progress: bool) -> anyhow::Result<()> {
+    pub fn split(&self, hacks: &dyn Hacks, file_list: &Vec<(String, Object)>, path: &Path, no_progress: bool) -> anyhow::Result<()> {
         let m = if no_progress { None } else {
             println!(" Step 1 / 3: Collecting references...");
             Some(MultiProgress::new())
         };
 
-        let references = self.get_references(m)?;
+        let references = self.get_references(hacks, m)?;
         let helper = NsoLookupHelper::new(self)?;
         fs::create_dir_all(path)?;
 
@@ -611,7 +611,7 @@ impl NSO {
         */
     }
 
-    fn get_references(&self, m: Option<MultiProgress>) -> anyhow::Result<References> {
+    fn get_references(&self, hacks: &dyn Hacks, m: Option<MultiProgress>) -> anyhow::Result<References> {
         let mut reference_tracker = ReferenceTracker::new();
 
         let function_symbols: HashSet<u64> = self.symbol_table.1.iter()
@@ -630,7 +630,18 @@ impl NSO {
             call_with_progress(&m, name, i+1, total_collect_references, f, (&mut reference_tracker, &m))?;
         }
 
-        self.collect_jumptable_references(&mut reference_tracker)?;
+        // TODO: apply jumptable from hacks
+        for (jt_target, jt_size) in hacks.get_jump_tables() {
+            let cursor = &mut Cursor::new(&self.file.memory[jt_target as usize ..]);
+            for i in 0..jt_size as u64 {
+                let offset = cursor.read_le::<i32>()?;
+                let target = (jt_target as i64 + offset as i64) as u64;
+                reference_tracker.add_reference(target, ReferenceSource::JumpTable, jt_target + i*4, DataRefType::Code);
+            }
+            reference_tracker.add_reference(jt_target, ReferenceSource::Hack, 0xDEADBEEF, DataRefType::JumpTable(jt_size as u64));
+        }
+
+        //self.collect_jumptable_references(&mut reference_tracker)?;
 
         Ok(reference_tracker.finalize()?)
     }
@@ -923,7 +934,7 @@ impl NSO {
                             }
                         } else {
                             let data = cursor.read_le::<u64>()?;
-                            ensure!(data == target, "Reference at {:X} points to {:X}, but data is {:X}", data_entry_offset, target, data);
+                            ensure!(data == target, "Reference at {:X} points to {:X}, but data is {:X} (type: {:?})", data_entry_offset, target, data, references.get_type_of(data_entry_offset));
                             // references are either objects (by symbols), unknown (by references) or int64 (by 64-bit loads)
                             ensure!(references.get_type_of(data_entry_offset).is_none_or(|x| matches!(x, DataRefType::Object(_) | DataRefType::Unknown | DataRefType::Int64)),
                                 "Reference at {:X} points to {:X}, but is not marked as object. Instead: {:?}", data_entry_offset, target, references.get_type_of(data_entry_offset)

@@ -32,7 +32,8 @@ pub enum ReferenceSource {
     Relocation,    // offset of relocation
     InitArray,     // index of init_array entry
     JumpTableUsage,// set of instructions to load/use jump table
-    JumpTable,     // jump table entry 
+    JumpTable,     // jump table entry
+    Hack,          // added by hack
 }
 
 #[derive(Debug)]
@@ -96,6 +97,8 @@ impl ReferenceTracker {
                         "ADRP source cannot point to multiple targets with different higher bits, old: 0x{:X}, new: 0x{:X} at 0x{:X}",
                         *old_target, target, source_offset
                     );*/
+                } else if source_type == ReferenceSource::Hack {
+                    // hacks can point to multiple targets (e.g. jump table usages)
                 } else {
                     ensure!(*old_target == target, "Source already points to a different target: old: 0x{:X}, new: 0x{:X} at 0x{:X}", *old_target, target, source);
                 }

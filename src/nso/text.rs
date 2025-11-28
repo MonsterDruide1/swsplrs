@@ -129,6 +129,7 @@ impl TextSection {
     }
 
     // TODO: automatically analyze function boundaries to avoid `function_starts` and allow symbol-less binaries
+    // TODO: automatically analyze jump tables to add references from data
     pub fn collect_references(&self, function_starts: &HashSet<u64>, mut reference_tracker: &mut ReferenceTracker, mpb: &Option<MultiProgress>) -> anyhow::Result<()> {
         let function_starts = function_starts.into_iter().chain(self.plt_functions.iter().map(|(x,_)| x)).copied().collect::<HashSet<u64>>();
         
@@ -156,7 +157,7 @@ impl TextSection {
         //  LDRSW Xj, [Xt, Xm, LSL #2]
         //  ADD Xj, Xj, Xt
         //  BR Xj
-        // TODO: currently only detects within a single basic block
+        // TODO: currently only detects within a single basic block. This is a problem, for example `0x7100B63714` in SMO
         #[derive(Debug, Clone)]
         struct JumpTableDetectState {
             table_register: capstone::RegId,
@@ -403,7 +404,8 @@ impl TextSection {
 
                                     get_operand_imm(&cmp_detail, 1)? + 1
                                 };
-                                reference_tracker.add_reference(jt.table_offset, ReferenceSource::JumpTableUsage, instr.address(), DataRefType::JumpTable(jmp_table_size));
+                                // TODO: commented away to apply data from hacks instead
+                                //reference_tracker.add_reference(jt.table_offset, ReferenceSource::JumpTableUsage, instr.address(), DataRefType::JumpTable(jmp_table_size));
                             }
                         }
                     }

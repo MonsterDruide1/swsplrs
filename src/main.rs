@@ -1,12 +1,25 @@
 mod nso;
+mod hacks;
 mod reference_tracker;
 mod file_list;
 mod utils;
 mod objdiff;
 use crate::nso::{nso::NSO, nso_file::NsoFile};
 
-use argh::FromArgs;
+use argh::{FromArgValue, FromArgs};
 use std::fs::File;
+
+enum Game {
+    SMO,
+}
+impl FromArgValue for Game {
+    fn from_arg_value(value: &str) -> Result<Self, String> {
+        match value.to_lowercase().as_str() {
+            "smo" => Ok(Game::SMO),
+            _ => Err(format!("Unknown game: {}", value)),
+        }
+    }
+}
 
 /// A toolchain used for splitting up Nintendo Switch binaries for decompilation.
 #[derive(FromArgs)]
@@ -26,6 +39,9 @@ struct Args {
     /// write `objdiff.json` file with configuration for objdiff
     #[argh(switch)]
     objdiff: bool,
+    /// game to assume for using hardcoded hacks
+    #[argh(option)]
+    game: Option<Game>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -33,6 +49,14 @@ fn main() -> anyhow::Result<()> {
 
     println!("Reading NSO file...");
     let nso = NSO::new(NsoFile::new(File::open(&args.input)?)?)?;
+
+    let hacks = match args.game {
+        Some(Game::SMO) => {
+            println!("Applying SMO hacks...");
+            Some(hacks::smo_hacks::SMOHacks::new()?)
+        },
+        None => None,
+    };
 
     // TODO: make this path configurable
     let file_list_path = std::path::Path::new("data/file_list.yml");
@@ -45,13 +69,13 @@ fn main() -> anyhow::Result<()> {
 
     if args.export_all {
         println!("Exporting all segments to 'out/asm' directory...");
-        nso.export_all(std::path::Path::new("out/asm"), args.no_progress)?;
+        nso.export_all(std::path::Path::new("out/asm"), hacks.as_ref().expect("Hacks not found"), args.no_progress)?;
         println!("Done.");
     }
 
     if args.split {
         println!("Splitting NSO file...");
-        nso.split(file_list.as_ref().expect("File list not found"), std::path::Path::new("out/split"), args.no_progress)?;
+        nso.split(hacks.as_ref().expect("Hacks not found"), file_list.as_ref().expect("File list not found"), std::path::Path::new("out/split"), args.no_progress)?;
         println!("Done.");
     }
 
