@@ -33,6 +33,9 @@ struct Args {
     /// export all segments to out/asm as individual files
     #[argh(switch)]
     export_all: bool,
+    /// export relinkable segments to out/asm as individual files (excludes linker-generated segments)
+    #[argh(switch)]
+    export_relinkable: bool,
     /// export individual objects as separate assembly files
     #[argh(switch)]
     split: bool,
@@ -70,6 +73,12 @@ fn main() -> anyhow::Result<()> {
     if args.export_all {
         println!("Exporting all segments to 'out/asm' directory...");
         nso.export_all(std::path::Path::new("out/asm"), hacks.as_ref().expect("Hacks not found"), args.no_progress)?;
+        println!("Done.");
+    }
+
+    if args.export_relinkable {
+        println!("Exporting relinkable segments to 'out/asm' directory...");
+        nso.export_relinkable(std::path::Path::new("out/asm"), hacks.as_ref().expect("Hacks not found"), args.no_progress)?;
         println!("Done.");
     }
 

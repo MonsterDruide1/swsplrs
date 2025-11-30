@@ -262,6 +262,41 @@ impl NSO {
         Ok(())
     }
 
+    pub fn export_relinkable(&self, path: &Path, hacks: &dyn Hacks, no_progress: bool) -> anyhow::Result<()> {
+        let m = if no_progress { None } else {
+            println!(" Step 1 / 2: Collecting references...");
+            Some(MultiProgress::new())
+        };
+
+        let references = self.get_references(hacks, m)?;
+        let helper = NsoLookupHelper::new(self)?;
+        fs::create_dir_all(path)?;
+
+        let export_sections: Vec<(&str, Box<dyn FnMut((&References, &Option<MultiProgress>)) -> anyhow::Result<()>>)> = vec![
+            ("exported_symbols.sym", Box::new(|(_,_)| self.export_symbol_list(path.join("exported_symbols.sym")))),
+            (".init_array", Box::new(|(r,_)| self.export_init_array(path.join("init_array.s"), r, &helper))),
+            ("crt0", Box::new(|(_,_)| self.export_crt0(path.join("crt0.s")))),
+            ("unknown data gap", Box::new(|(_,_)| self.export_unknown_data_gap(path.join("unknown_data_gap.s")))),
+            (".module_name", Box::new(|(_,_)| self.export_module_name(path.join("module_name.s")))),
+            (".embed", Box::new(|(_,_)| self.export_embed(path.join("embed.s"), &helper))),
+            (".text", Box::new(|(r,m)| self.text.export_asm(path.join("text.s"), r, &helper, m, &self))),
+            (".bss", Box::new(|(r,m)| self.export_bss(path.join("bss.s"), r, &helper, m))),
+            (".data", Box::new(|(r,m)| self.export_data(path.join("data.s"), r, &helper, m))),
+            (".rodata", Box::new(|(r,m)| self.export_rodata(path.join("rodata.s"), r, &helper, m))),
+        ];
+        let total_export_sections = export_sections.len();
+
+        let m = if no_progress { None } else {
+            println!(" Step 2 / 2: Exporting assembly...");
+            Some(MultiProgress::new())
+        };
+        for (i, (name, f)) in export_sections.into_iter().enumerate() {
+            call_with_progress(&m, name, i+1, total_export_sections, f, (&references, &m))?;
+        }
+
+        Ok(())
+    }
+
     pub fn split(&self, hacks: &dyn Hacks, file_list: &Vec<(String, Object)>, path: &Path, no_progress: bool) -> anyhow::Result<()> {
         let m = if no_progress { None } else {
             println!(" Step 1 / 3: Collecting references...");
