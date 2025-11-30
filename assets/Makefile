@@ -1,4 +1,5 @@
-all: clean assemble link nso copy
+-include Makefile.secret
+all: clean assemble link nso copy send
 
 clean:
 	rm -r obj || true
@@ -17,3 +18,5 @@ nso:
 copy:
 	cp myprog /mnt/d/
 	cp myprog.un.nso /mnt/d/
+send:
+	ncftpput -C -u ${FTP_USER} -p ${FTP_PASS} -P 5000 ${FTP_IP} myprog.un.nso /atmosphere/contents/${TITLE_ID}/exefs/main
