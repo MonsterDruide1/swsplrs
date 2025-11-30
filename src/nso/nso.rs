@@ -226,6 +226,7 @@ impl NSO {
         fs::create_dir_all(path)?;
 
         let export_sections: Vec<(&str, Box<dyn FnMut((&References, &Option<MultiProgress>)) -> anyhow::Result<()>>)> = vec![
+            ("exported_symbols.sym", Box::new(|(_,_)| self.export_symbol_list(path.join("exported_symbols.sym")))),
             (".got.plt", Box::new(|(_,_)| self.export_got_plt(path.join("got.plt.s")))),
             (".got", Box::new(|(_,_)| self.export_got(path.join("got.s"), &helper))),
             (".init_array", Box::new(|(r,_)| self.export_init_array(path.join("init_array.s"), r, &helper))),
@@ -1194,6 +1195,18 @@ impl NSO {
             writeln!(file, ".global {}", self.get_symbol(*offset, helper)?)?;
             writeln!(file, "{}:", self.get_symbol(*offset, helper)?)?;
             writeln!(file, "\t.string \"{}\"", escape_for_asm_string(value))?;
+        }
+
+        Ok(())
+    }
+
+    fn export_symbol_list(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+
+        for symbol in self.symbol_table.1.iter() {
+            let name = self.dynstr_table.get(&(symbol.str_table_offset as u64));
+            writeln!(file, "{}", name.expect(format!("Symbol at {:X} has no name", symbol.value).as_str()))?;
         }
 
         Ok(())
