@@ -633,12 +633,14 @@ impl TextSection {
         let mut current_offset = self.section_offset as u64 + self.section.len() as u64;
         let mut current_target = got_plt.start + 0x10;
 
-        writeln!(file, ".global {}", parent.get_symbol(current_offset, helper)?)?;
-        writeln!(file, "{}:", parent.get_symbol(current_offset, helper)?)?;
+        for symbol in parent.get_symbols(current_offset, helper)? {
+            writeln!(file, ".global {}", symbol)?;
+            writeln!(file, "{}:", symbol)?;
+        }
         writeln!(file, "\tstp x16, x30, [sp, #-0x10]!")?;
-        writeln!(file, "\tadrp x16, {}", parent.get_symbol(current_target, helper)?)?;
-        writeln!(file, "\tldr x17, [x16, :lo12:{}]", parent.get_symbol(current_target, helper)?)?;
-        writeln!(file, "\tadd x16, x16, :lo12:{}", parent.get_symbol(current_target, helper)?)?;
+        writeln!(file, "\tadrp x16, {}", parent.get_any_symbol(current_target, helper)?)?;
+        writeln!(file, "\tldr x17, [x16, :lo12:{}]", parent.get_any_symbol(current_target, helper)?)?;
+        writeln!(file, "\tadd x16, x16, :lo12:{}", parent.get_any_symbol(current_target, helper)?)?;
         writeln!(file, "\tbr x17")?;
         writeln!(file, "\tnop")?;
         writeln!(file, "\tnop")?;
@@ -649,11 +651,13 @@ impl TextSection {
 
         for _ in 3..(got_plt.end-got_plt.start)/8 {
             writeln!(file)?;
-            writeln!(file, ".global {}", parent.get_symbol(current_offset, helper)?)?;
-            writeln!(file, "{}:", parent.get_symbol(current_offset, helper)?)?;
-            writeln!(file, "\tadrp x16, {}", parent.get_symbol(current_target, helper)?)?;
-            writeln!(file, "\tldr x17, [x16, :lo12:{}]", parent.get_symbol(current_target, helper)?)?;
-            writeln!(file, "\tadd x16, x16, :lo12:{}", parent.get_symbol(current_target, helper)?)?;
+            for symbol in parent.get_symbols(current_offset, helper)? {
+                writeln!(file, ".global {}", symbol)?;
+                writeln!(file, "{}:", symbol)?;
+            }
+            writeln!(file, "\tadrp x16, {}", parent.get_any_symbol(current_target, helper)?)?;
+            writeln!(file, "\tldr x17, [x16, :lo12:{}]", parent.get_any_symbol(current_target, helper)?)?;
+            writeln!(file, "\tadd x16, x16, :lo12:{}", parent.get_any_symbol(current_target, helper)?)?;
             writeln!(file, "\tbr x17")?;
 
             current_offset += 4*4;
@@ -689,8 +693,10 @@ impl TextSection {
             if references.has_references_to(instr.address()) {
                 // TODO not always mark as `.global {sym}` (for local branches)
                 writeln!(file, "# 0x{:X}:", instr.address())?;
-                writeln!(file, ".global {}", parent.get_symbol(instr.address(), helper)?)?;
-                writeln!(file, "{}:", parent.get_symbol(instr.address(), helper)?)?;
+                for symbol in parent.get_symbols(instr.address(), helper)? {
+                    writeln!(file, ".global {}", symbol)?;
+                    writeln!(file, "{}:", symbol)?;
+                }
             }
 
             self.disassemble_instruction(&instr, &mut file, &cs, references, helper, parent)?;
@@ -722,10 +728,14 @@ impl TextSection {
         while let Some(instr) = iter.next() {
             if obj.text_section.iter().any(|info| instr.address() == info.offset as u64) {
                 writeln!(file, "# 0x{:X}:", instr.address())?;
-                writeln!(file, ".global {}", parent.get_symbol(instr.address(), helper)?)?;
-                writeln!(file, "{}:", parent.get_symbol(instr.address(), helper)?)?;
+                for symbol in parent.get_symbols(instr.address(), helper)? {
+                    writeln!(file, ".global {}", symbol)?;
+                    writeln!(file, "{}:", symbol)?;
+                }
             } else if references.has_references_to(instr.address()) {
-                writeln!(file, "{}:", parent.get_symbol(instr.address(), helper)?)?;
+                for symbol in parent.get_symbols(instr.address(), helper)? {
+                    writeln!(file, "{}:", symbol)?;
+                }
             }
 
             self.disassemble_instruction(&instr, file, &cs, references, helper, parent)?;
@@ -768,17 +778,17 @@ impl TextSection {
                     let got_target = parent.get_got_target_symbol(*plt_target, references, helper)?;
                     writeln!(file, "\t{} {}", mnemonic, got_target)?;
                 } else {
-                    writeln!(file, "\t{} {}", mnemonic, parent.get_symbol(target, helper)?)?;
+                    writeln!(file, "\t{} {}", mnemonic, parent.get_any_symbol(target, helper)?)?;
                 }
             }
             "tbz" | "tbnz" => {
-                writeln!(file, "\t{} {}, #{}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_imm(&detail, 1)?, parent.get_symbol(reference_target?, helper)?)?;
+                writeln!(file, "\t{} {}, #{}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_imm(&detail, 1)?, parent.get_any_symbol(reference_target?, helper)?)?;
             }
             "cbz" | "cbnz" => {
-                writeln!(file, "\t{} {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, parent.get_symbol(reference_target?, helper)?)?;
+                writeln!(file, "\t{} {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, parent.get_any_symbol(reference_target?, helper)?)?;
             }
             s if s.starts_with("b.") => {  // conditionals with b (b.eq, b.ne, b.lt, ...)
-                writeln!(file, "\t{} {}", mnemonic, parent.get_symbol(reference_target?, helper)?)?;
+                writeln!(file, "\t{} {}", mnemonic, parent.get_any_symbol(reference_target?, helper)?)?;
             }
 
             // loads/stores
@@ -788,7 +798,7 @@ impl TextSection {
                 let &section = parent.sections.get(target).expect("Reference target not in any section");
                 match section {
                     SectionType::Data | SectionType::Bss | SectionType::Rodata | SectionType::Text | SectionType::Embed => {
-                        writeln!(file, "\t{} {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, parent.get_symbol(target, helper)?)?;
+                        writeln!(file, "\t{} {}, {}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, parent.get_any_symbol(target, helper)?)?;
                     },
                     SectionType::Got => {
                         writeln!(file, "\t{} {}, :got:{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, parent.get_got_target_symbol(target, references, helper)?)?;
@@ -803,7 +813,7 @@ impl TextSection {
                     let &section = parent.sections.get(target).expect("Reference target not in any section");
                     match section {
                         SectionType::Data | SectionType::Bss | SectionType::Rodata | SectionType::Text | SectionType::Embed => {
-                            writeln!(file, "\t{} {}, {}, :lo12:{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, parent.get_symbol(target, helper)?)?;
+                            writeln!(file, "\t{} {}, {}, :lo12:{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, parent.get_any_symbol(target, helper)?)?;
                         },
                         SectionType::Got => {
                             writeln!(file, "\t{} {}, {}, :got_lo12:{}", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, get_operand_reg_name(&detail, 1, &cs)?, parent.get_got_target_symbol(target, references, helper)?)?;
@@ -823,7 +833,7 @@ impl TextSection {
                     let &section = parent.sections.get(target).expect("Reference target not in any section");
                     match section {
                         SectionType::Data | SectionType::Bss | SectionType::Rodata | SectionType::Text | SectionType::Embed => {
-                            writeln!(file, "\t{} {}, [{}, :lo12:{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, parent.get_symbol(target, helper)?)?;
+                            writeln!(file, "\t{} {}, [{}, :lo12:{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, parent.get_any_symbol(target, helper)?)?;
                         },
                         SectionType::Got => {
                             writeln!(file, "\t{} {}, [{}, :got_lo12:{}]", mnemonic, get_operand_reg_name(&detail, 0, &cs)?, base_reg_name, parent.get_got_target_symbol(target, references, helper)?)?;

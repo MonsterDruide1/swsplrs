@@ -362,45 +362,49 @@ impl NSO {
         Ok(())
     }
 
-    pub fn get_symbol(&self, address: u64, helper: &NsoLookupHelper) -> Result<String> {
+    pub fn get_symbols(&self, address: u64, helper: &NsoLookupHelper) -> Result<Vec<String>> {
         // if symbol exists for address, use it
-        if let Some(idx) = helper.symbol_table_value_to_idx.get(&address) {
-            let Some(name) = self.dynstr_table.get(&(self.symbol_table.1[*idx].str_table_offset as u64)) else {
-                bail!("Symbol at {:X} has no name", address);
-            };
-            return Ok(name.clone());
+        if let Some(idxs) = helper.symbol_table_value_to_idx.get(&address) {
+            let mut names = Vec::new();
+            for idx in idxs {
+                let Some(name) = self.dynstr_table.get(&(self.symbol_table.1[*idx].str_table_offset as u64)) else {
+                    bail!("Symbol at {:X} has no name", address);
+                };
+                names.push(name.clone());
+            }
+            return Ok(names);
         }
         // special case for section start/end addresses (used by _init and _fini)
         if let Some(plt_range) = self.sections.get_range(&SectionType::Plt) && address == plt_range.start {
-            return Ok("__plt_start__".to_string());
+            return Ok(vec!["__plt_start__".to_string()]);
         }
         if let Some(got_plt_range) = self.sections.get_range(&SectionType::GotPlt) && address == got_plt_range.start {
-            return Ok("__got_start__".to_string());
+            return Ok(vec!["__got_start__".to_string()]);
         }
         if let Some(dynamic_range) = self.sections.get_range(&SectionType::Dynamic) && address == dynamic_range.start {
-            return Ok("__dynamic_start__".to_string());
+            return Ok(vec!["__dynamic_start__".to_string()]);
         }
         if let Some(rela_plt_range) = self.sections.get_range(&SectionType::RelaPlt) {
             if rela_plt_range.start == address {
-                return Ok("__rela_plt_start".to_string());
+                return Ok(vec!["__rela_plt_start".to_string()]);
             }
             if rela_plt_range.end == address {
-                return Ok("__rela_plt_end".to_string());
+                return Ok(vec!["__rela_plt_end".to_string()]);
             }
         }
         if let Some(rela_dyn_range) = self.sections.get_range(&SectionType::RelaDyn) {
             if rela_dyn_range.start == address {
-                return Ok("__rela_dyn_start".to_string());
+                return Ok(vec!["__rela_dyn_start".to_string()]);
             }
             if rela_dyn_range.end == address {
-                return Ok("__rela_dyn_end".to_string());
+                return Ok(vec!["__rela_dyn_end".to_string()]);
             }
         }
         if let Some(init_array_range) = self.sections.get_range(&SectionType::InitArray) && address == init_array_range.end {
             // TODO: figure out how to handle tdata/tbss symbols, which these *actually* mark - not just the end of .init_array
             //  tdata_start, tdata_end, tdata_align_rel,
             //  tbss_start,  tbss_end,  tbss_align_rel
-            return Ok("__tdata_start__".to_string());
+            return Ok(vec!["__tdata_start__".to_string()]);
         }
         // otherwise use `loc_X` for .text or `off_X` for .data/.rodata/.bss
         let prefix = if self.file.is_address_in_segment(address, &NsoSegment::Text) {
@@ -408,7 +412,13 @@ impl NSO {
         } else {
             "off"
         };
-        Ok(format!("{}_{:X}", prefix, address))
+        Ok(vec![format!("{}_{:X}", prefix, address)])
+    }
+
+    pub fn get_any_symbol(&self, address: u64, helper: &NsoLookupHelper) -> Result<String> {
+        let symbols = self.get_symbols(address, helper)?;
+        let item = symbols.into_iter().find(|s| !s.is_empty()).expect(format!("No valid symbol found for address {:X}", address).as_str());
+        Ok(item)
     }
 
     pub fn get_got_target_symbol(&self, got_address: u64, references: &References, helper: &NsoLookupHelper) -> Result<String> {
@@ -416,7 +426,7 @@ impl NSO {
         let target = references.get_target_address(got_address).ok_or_else(|| anyhow::anyhow!("No reference found for GOT entry at {:X}", got_address))?;
         let target_type = references.get_type_of(target).ok_or_else(|| anyhow::anyhow!("No reference type found for GOT target at {:X}", target))?;
         let DataRefType::SymbolAbsolute(addend) = target_type else {
-            return Ok(self.get_symbol(target, helper)?);
+            return self.get_any_symbol(target, helper);
         };
         ensure!(addend == 0, "GOT target at {:X} has unexpected addend: {}", target, addend);
         //let symbol_offset = self.symbol_table.0 + relocation.sym_idx as u64 * std::mem::size_of::<DynamicSymbol>() as u64;
@@ -865,7 +875,7 @@ impl NSO {
         for (i, &func) in array.iter().enumerate() {
             ensure!(!references.has_references_to(offset + i as u64*8) || i == 0, "Unexpected reference to .init_array entry {} at {:X} found", i, func);
             ensure!(helper.symbol_table_value_to_idx.get(&func).is_none(), "Unexpected symbol for .init_array entry {} at {:X} found", i, func);
-            writeln!(file, "\t.quad {}", self.get_symbol(func, helper)?)?;
+            writeln!(file, "\t.quad {}", self.get_any_symbol(func, helper)?)?;
         }
 
         Ok(())
@@ -889,9 +899,10 @@ impl NSO {
 
             let bss_entry_offset = self.module.bss_start as u64 + self.module.header_offset as u64 + i;
             if references.has_references_to(bss_entry_offset) {
-                let symbol = self.get_symbol(bss_entry_offset, helper)?;
-                writeln!(file, ".global {}", symbol)?;
-                writeln!(file, "{}:", symbol)?;
+                for symbol in self.get_symbols(bss_entry_offset, helper)? {
+                    writeln!(file, ".global {}", symbol)?;
+                    writeln!(file, "{}:", symbol)?;
+                }
             }
             writeln!(file, "\t.skip 1")?;
         }
@@ -945,9 +956,10 @@ impl NSO {
             // TODO: if outgoing reference, format as .quad
             let data_entry_offset = offset + cursor.position();
             if references.has_references_to(data_entry_offset) {
-                let symbol = self.get_symbol(data_entry_offset, helper)?;
-                writeln!(file, ".global {}", symbol)?;
-                writeln!(file, "{}:", symbol)?;
+                for symbol in self.get_symbols(data_entry_offset, helper)? {
+                    writeln!(file, ".global {}", symbol)?;
+                    writeln!(file, "{}:", symbol)?;
+                }
             }
             if let Some(target) = references.get_target_address(data_entry_offset) {
                 match references.get_type_of(target) {
@@ -966,7 +978,7 @@ impl NSO {
                             for _ in 0..size {
                                 let offset = cursor.read_le::<i32>()?;
                                 let target = (data_entry_offset as i64 + offset as i64) as u64;
-                                writeln!(file, "\t.word {} - {}", self.get_symbol(target, helper)?, self.get_symbol(data_entry_offset, helper)?)?;
+                                writeln!(file, "\t.word {} - {}", self.get_any_symbol(target, helper)?, self.get_any_symbol(data_entry_offset, helper)?)?;
                             }
                         } else {
                             let data = cursor.read_le::<u64>()?;
@@ -975,7 +987,7 @@ impl NSO {
                             ensure!(references.get_type_of(data_entry_offset).is_none_or(|x| matches!(x, DataRefType::Object(_) | DataRefType::Unknown | DataRefType::Int64)),
                                 "Reference at {:X} points to {:X}, but is not marked as object. Instead: {:?}", data_entry_offset, target, references.get_type_of(data_entry_offset)
                             );
-                            writeln!(file, "\t.quad {}", self.get_symbol(target, helper)?)?;
+                            writeln!(file, "\t.quad {}", self.get_any_symbol(target, helper)?)?;
                         }
                     }
                     Some(_) => {
@@ -985,7 +997,7 @@ impl NSO {
                         ensure!(references.get_type_of(data_entry_offset).is_none_or(|x| matches!(x, DataRefType::Object(_) | DataRefType::Unknown | DataRefType::Int64)),
                             "Reference at {:X} points to {:X}, but is not marked as object. Instead: {:?}", data_entry_offset, target, references.get_type_of(data_entry_offset)
                         );
-                        writeln!(file, "\t.quad {}", self.get_symbol(target, helper)?)?;
+                        writeln!(file, "\t.quad {}", self.get_any_symbol(target, helper)?)?;
                     }
                 }
             } else if let Some(data_type) = references.get_type_of(data_entry_offset) {
@@ -1227,8 +1239,10 @@ impl NSO {
         writeln!(file, ".section \".embed\", \"a\"")?;
 
         for (offset, value) in self.embed.iter() {
-            writeln!(file, ".global {}", self.get_symbol(*offset, helper)?)?;
-            writeln!(file, "{}:", self.get_symbol(*offset, helper)?)?;
+            for symbol in self.get_symbols(*offset, helper)? {
+                writeln!(file, ".global {}", symbol)?;
+                writeln!(file, "{}:", symbol)?;
+            }
             writeln!(file, "\t.string \"{}\"", escape_for_asm_string(value))?;
         }
 
@@ -1323,8 +1337,9 @@ impl NSO {
                     for &target in chunk {
                         let end_of_target = (target + 1..end_of_section).find(|t| references.has_references_to(*t)).unwrap_or(end_of_section);
 
-                        let symbol = self.get_symbol(target, helper)?;
-                        writeln!(file, "{}:", symbol)?;
+                        for symbol in self.get_symbols(target, helper)? {
+                            writeln!(file, "{}:", symbol)?;
+                        }
                         for t in target..end_of_target {
                             match section {
                                 SectionType::Bss => writeln!(file, "\t.skip 1")?,
@@ -1593,16 +1608,16 @@ impl ExceptionHeaderEncoding {
 
 pub struct NsoLookupHelper {
     reloc_dyn_addr_to_idx: HashMap<u64, usize>,
-    symbol_table_value_to_idx: HashMap<u64, usize>,
+    symbol_table_value_to_idx: HashMap<u64, Vec<usize>>,
 }
 impl NsoLookupHelper {
     pub fn new(nso: &NSO) -> anyhow::Result<Self> {
         let reloc_dyn_addr_to_idx = nso.reloc_dyn_table.iter().enumerate().map(|(i,r)| (r.offset, i)).collect::<HashMap<_, _>>();
         ensure!(reloc_dyn_addr_to_idx.len() == nso.reloc_dyn_table.len(), "Duplicate entries in .rela.dyn");
 
-        let symbol_table_value_to_idx = nso.symbol_table.1.iter().enumerate().map(|(i, sym)| (sym.value, i)).collect::<HashMap<_, _>>();
-        if symbol_table_value_to_idx.len() != nso.symbol_table.1.len() {
-            println!("Warning: {} duplicate symbol values in symbol table. Using last one when lookups are done.", nso.symbol_table.1.len() - symbol_table_value_to_idx.len());
+        let mut symbol_table_value_to_idx: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (i, sym) in nso.symbol_table.1.iter().enumerate() {
+            symbol_table_value_to_idx.entry(sym.value).or_default().push(i);
         }
 
         Ok(Self { reloc_dyn_addr_to_idx, symbol_table_value_to_idx })
