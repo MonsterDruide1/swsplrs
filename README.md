@@ -29,7 +29,23 @@ There are three major categories we have to worry about: Relocations, Instructio
 
 #### Relocations
 
-To be fair, I don't fully understand what is going on here either. Something about the `.got` and `.got.plt` sections along with `.rela.plt` and `.rela.dyn`, but that one was straight-forward, with good-looking result, so I didn't look into it further.
+Two sections are relevant here: `.rela.dyn` and `.rela.plt`, which contains relocations (same type). Let's look at the general structure of relocations first:
+```
+pub struct Relocation {
+    pub offset: u64,
+    pub reloc_type: RelocationType,  // 32-bit type, for example `R_AARCH64_ABS64` or `R_AARCH64_RELATIVE`
+    pub sym_idx: u32,
+    pub addend: i64,
+}
+```
+
+The `offset` always points to the offset which contains a relocatable reference. The content of `sym_idx` and `addend` depends on `reloc_type`, where we're usually faced with the following three options:
+- `R_AARCH64_GLOB_DAT` and `R_AARCH64_ABS64`: `sym_idx` points to an entry in the symbols (`.dynsym`), and potentially an offset (+/- a small value) as `addend` from wherever the symbol points.
+- `R_AARCH64_RELATIVE`: only `addend` is useful here, which points to some arbitrary offset in the binary.
+
+`.rela.plt` does not contain these three types of relocations, but instead only `R_AARCH64_JUMP_SLOT`, which works similar to `R_AARCH64_GLOB_DAT`/`_ABS64` though (symbol + addend).
+
+This means that for all addresses pointed to by `offset` in the relocations, we can just look up where those are supposed to point - and insert direct references by label in the assembly, instead of the dummy values usually in place there instead.
 
 #### Instructions
 
@@ -64,4 +80,31 @@ To analyze this, I'm taking an approach similar to Live-variable analysis, mixed
 
 #### Data
 
-Not implemented yet.
+Most references to other things in `.data` and `.rodata` are already covered by relocations, as explained above. However, there is one more type of position-dependent data: Jump Tables.
+
+Whenever the compiler is supposed to generate a long chain of `if / else if / else if / ...` or a large-enough `switch` statement, it can decide that instead of manually checking each condition, it does a table lookup and directly jumps to the correct code snippet. In assembly, this results in a snippet like thsi:
+```arm
+; load address to jump table
+adrp x10, #jump_table@PAGE
+add x10, x10, #jump_table@PAGEOFF
+
+ldrsw x14, [x10, x14, LSL#2]  ; load 32-bit value from correct entry of jump table (index: x14)
+add x14, x14, x10             ; adjust loaded value by address of jump table
+br x14                        ; jump to target branch
+```
+
+Regarding how jump tables are stored, this means that `.rodata` contains something like this:
+```arm
+.global off_188B848
+off_188B848:
+    .word loc_42C3C - off_188B848
+    .word loc_42C3C - off_188B848
+    .word loc_42C44 - off_188B848
+    .word loc_42C3C - off_188B848
+    .word loc_42C3C - off_188B848
+    .word loc_42C44 - off_188B848
+```
+
+These 32-bit values stored here therefore represent the offset from the location of the jump table (in `.rodata`) to the right address (in `.text`), a high negative number. And this time, no relocations or other external data are here to help us find and resolve these jump tables.
+
+Currently, the problem of these jump tables is unsolved. `src/hacks/smo_hacks.rs` contains a list of known jump tables within Super Mario Odyssey, as we're not able to detect them automatically yet  - they are identified by the previously-shown sequence of 5 instructions, which may be split into multiple basic blocks arbitrarily, which makes analysis quite difficult.
