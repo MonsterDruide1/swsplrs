@@ -7,7 +7,7 @@ clean:
 	rm myprog.nso || true
 	rm myprog.un.nso || true
 glslc:
-	aarch64-linux-gnu-gcc -shared -o libglslc.so -fPIC glslcStubs.c
+	aarch64-linux-gnu-gcc -shared -o libglslc.so -fPIC ../assets/glslcStubs.c
 cxxstubs:
 	mkdir -p obj
 	aarch64-linux-gnu-gcc -c -o obj/cxxstubs.o ../assets/cxxstubs.c
