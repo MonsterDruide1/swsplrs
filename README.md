@@ -1,8 +1,15 @@
 # swsplrs - swspl, but in Rust.
 
+> [!WARNING]
+> This project is unfinished. Don't expect anything to be working at the moment.
+
 This program should eventually be able to split NSO binaries into multiple object files.
 
 This is a rewrite and continuation of shibbo's [swspl](https://github.com/shibbo/swspl).
+
+## Usage
+
+The `Makefile` provides an overview of the two current options, `relink` and `objdiff`. Try running them (or `make setup`) repeatedly and follow instructions until no errors occur. After that, you probably want to run things manually to only run the necessary steps (instead of everything). Also check `assets/Makefile` (which is copied to `out/Makefile`) for smaller steps and more information on relinking.
 
 ## Problem Description
 
