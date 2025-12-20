@@ -1,5 +1,6 @@
 {
     "files.watcherExclude": {
-        "out/**": true
+        "out/**": true,
+        "out_old/**": true
     }
 }
