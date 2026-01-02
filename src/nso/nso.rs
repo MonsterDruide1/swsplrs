@@ -2,6 +2,7 @@ use std::{collections::{BTreeMap, HashMap, HashSet, VecDeque}, fs::{self, File},
 
 use anyhow::{bail, ensure, Context, Result};
 use binrw::{binread, BinRead, BinReaderExt, NullString};
+use gimli::*;
 use indexmap::IndexSet;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle, ProgressIterator};
 use num_enum::TryFromPrimitive;
@@ -152,7 +153,10 @@ impl NSO {
         // .eh_frame_hdr
         let (_, _, eh_frame_hdr_size) = Self::parse_eh_frame_hdr(
             &file.memory,
-            module.ex_info_start_offset as u64 + module.header_offset as u64
+            module.ex_info_start_offset as u64 + module.header_offset as u64,
+            &module,
+            &text,
+            &sections
         )?;
         sections.insert_size(
             module.ex_info_start_offset as u64 + module.header_offset as u64,
@@ -590,7 +594,7 @@ impl NSO {
         Ok(strings)
     }
 
-    fn parse_eh_frame_hdr(memory: &[u8], offset: u64) -> anyhow::Result<(BTreeMap<u64, u64>, u64, u64)> {
+    fn parse_eh_frame_hdr(memory: &[u8], offset: u64, module: &Module, text: &TextSection, sections: &SectionMap) -> anyhow::Result<(BTreeMap<u64, u64>, u64, u64)> {
         let mut cursor = Cursor::new(&memory[offset as usize ..]);
         
         ensure!(cursor.read_le::<u8>()? == 1, "Unsupported eh_frame_hdr version");
@@ -610,23 +614,22 @@ impl NSO {
 
         Ok((binary_search_table, eh_frame_ptr, cursor.position() as u64))
 
-        /*
-        let eh_frame_hdr_off = module.ex_info_start_offset as u64 + module.header_offset as u64;
+        /*let eh_frame_hdr_off = module.ex_info_start_offset as u64 + module.header_offset as u64;
         let bases = BaseAddresses::default()
             .set_eh_frame_hdr(eh_frame_hdr_off)
-            .set_text(text_off)
+            .set_text(text.section_offset as u64)
             .set_got(sections.get_range(&SectionType::Got).unwrap().start);
         let eh_frame_hdr = EhFrameHdr::new(
-            &file.memory[module.ex_info_start_offset as usize + module.header_offset as usize ..],
+            &memory[module.ex_info_start_offset as usize + module.header_offset as usize ..],
             gimli::LittleEndian
         ).parse(&bases, 8)?;
         let bases = BaseAddresses::default()
             .set_eh_frame_hdr(eh_frame_hdr_off)
-            .set_text(text_off)
+            .set_text(text.section_offset as u64)
             .set_got(sections.get_range(&SectionType::Got).unwrap().start)
             .set_eh_frame(eh_frame_hdr.eh_frame_ptr().pointer());
         let eh_frame = gimli::EhFrame::new(
-            &file.memory[eh_frame_hdr.eh_frame_ptr().pointer() as usize ..],
+            &memory[eh_frame_hdr.eh_frame_ptr().pointer() as usize ..],
             gimli::LittleEndian
         );
         let mut entries = eh_frame.entries(&bases);
