@@ -1,9 +1,9 @@
 -include Makefile.secret
 all: clean cxxstubs missingfunctions assemble link nso copy send
 
-toolchain = ../data/
-clang = $(toolchain)clang -target aarch64-linux-gnu -nostdlib
+toolchain = $(PWD)/../data/
 lld = $(toolchain)ld.lld
+clang = $(toolchain)clang -target aarch64-linux-gnu -nostdlib
 
 clean:
 	rm -r obj || true
@@ -11,7 +11,7 @@ clean:
 	rm myprog.nso || true
 	rm myprog.un.nso || true
 glslc:
-	$(clang) -shared -o libglslc.so -fPIC ../assets/glslcStubs.c
+	$(clang) -shared -o libglslc.so -fPIC ../assets/glslcStubs.c -fuse-ld=$(lld)
 cxxstubs:
 	mkdir -p obj
 	$(clang) -c -o obj/cxxstubs.o ../assets/cxxstubs.c
