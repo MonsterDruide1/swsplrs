@@ -864,7 +864,7 @@ impl NSO {
     fn export_init_array(&self, path: impl AsRef<Path>, references: &References, helper: &NsoLookupHelper) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
-        writeln!(file, ".section \".init_array\"")?;
+        writeln!(file, ".section \".init_array\",\"aw\"")?;
         writeln!(file, "")?;
 
         let (offset, array) = &self.init_array;
@@ -918,7 +918,7 @@ impl NSO {
     fn export_data(&self, path: impl AsRef<Path>, references: &References, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         self.export_data_section(
             path,
-            ".data",
+            ".data", "aw",
             &self.file.memory,
             self.module.header_offset as u64 + self.module.dyn_offset as u64 - self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64,
             self.file.header.get_segment_mem_offset(&NsoSegment::Data) as u64,
@@ -928,7 +928,7 @@ impl NSO {
 
     fn export_rodata(&self, path: impl AsRef<Path>, references: &References, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         self.export_data_section(path,
-            ".rodata",
+            ".rodata", "a",
             &self.file.memory,
             self.module.ex_info_start_offset as u64 + self.module.header_offset as u64 - self.file.header.dynstr_size as u64 - (self.file.header.dynstr_offset as u64 + self.file.header.get_segment_mem_offset(&NsoSegment::Rodata) as u64),
             self.file.header.get_segment_mem_offset(&NsoSegment::Rodata) as u64 + self.file.header.dynstr_offset as u64 + self.file.header.dynstr_size as u64,
@@ -936,10 +936,10 @@ impl NSO {
         )
     }
 
-    fn export_data_section(&self, path: impl AsRef<Path>, name: &str, memory: &[u8], size: u64, offset: u64, references: &References, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
+    fn export_data_section(&self, path: impl AsRef<Path>, name: &str, perms: &str, memory: &[u8], size: u64, offset: u64, references: &References, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
-        writeln!(file, ".section \"{}\"", name)?;
+        writeln!(file, ".section \"{}\",\"{}\"", name, perms)?;
         writeln!(file, "")?;
 
         let pb = m.as_ref().map(|m|
@@ -1007,22 +1007,30 @@ impl NSO {
                     DataRefType::Int32 => writeln!(file, "\t.word 0x{:08X}", cursor.read_le::<u32>()?)?,
                     DataRefType::Int64 => writeln!(file, "\t.quad 0x{:016X}", cursor.read_le::<u64>()?)?,
                     DataRefType::Float32 => {
+                        // TODO: currently broken because clang does not like FLOAT_MAX as value
                         let val = cursor.read_le::<f32>()?;
+                        cursor.seek_relative(-4)?; // go back to re-read the bytes
+                        writeln!(file, "\t.word {}  // float: {}", cursor.read_le::<u32>()?, val)?;
+                        /*let val = cursor.read_le::<f32>()?;
                         if !val.is_finite() {
                             cursor.seek_relative(-4)?; // go back to re-read the bytes
                             writeln!(file, "\t.word {}  // float: {}", cursor.read_le::<u32>()?, val)?;
                         } else {
                             writeln!(file, "\t.float {}", val)?;
-                        }
+                        }*/
                     }
                     DataRefType::Float64 => {
+                        // TODO: currently broken because clang does not like DOUBLE_MAX as value
                         let val = cursor.read_le::<f64>()?;
+                        cursor.seek_relative(-8)?; // go back to re-read the bytes
+                        writeln!(file, "\t.quad {}  // double: {}", cursor.read_le::<u64>()?, val)?;
+                        /*let val = cursor.read_le::<f64>()?;
                         if !val.is_finite() {
                             cursor.seek_relative(-8)?; // go back to re-read the bytes
                             writeln!(file, "\t.quad {}  // double: {}", cursor.read_le::<u64>()?, val)?;
                         } else {
                             writeln!(file, "\t.double {}", val)?;
-                        }
+                        }*/
                     }
                     DataRefType::Float128 => {
                         for _ in 0..16 {
@@ -1068,7 +1076,7 @@ impl NSO {
     fn export_unknown_data_gap(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
-        writeln!(file, ".section \".unknown.data.gap\"")?;
+        writeln!(file, ".section \".unknown.data.gap\",\"aw\"")?;
         writeln!(file, "")?;
         writeln!(file, "\t.skip {}", 0x50)?;
 
@@ -1078,7 +1086,7 @@ impl NSO {
     fn export_module_name(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
-        writeln!(file, ".section \".rodata.module_name\"")?;
+        writeln!(file, ".section \".rodata.module_name\",\"a\"")?;
         writeln!(file, ".word 0")?;
         writeln!(file, ".word {}", self.build_str.len())?;
         //writeln!(file, ".quad 0")?;
@@ -1675,7 +1683,7 @@ __module_start:
     .word 0
     .word __nx_mod0 - __module_start
 
-.section ".text.mod0"
+.section ".text.mod0","ax"
 .global __nx_mod0
 __nx_mod0:
     .ascii "MOD0"

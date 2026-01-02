@@ -11,6 +11,8 @@ PHDRS
   dynamic PT_DYNAMIC;
 }
 
+ENTRY(__code_start__)
+
 SECTIONS
 {
   . = 0x0;
