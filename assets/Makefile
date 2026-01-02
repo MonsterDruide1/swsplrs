@@ -2,7 +2,7 @@
 all: clean cxxstubs missingfunctions assemble link nso copy send
 
 toolchain = ../data/
-clang = $(toolchain)clang -target aarch64-linux-gnu
+clang = $(toolchain)clang -target aarch64-linux-gnu -nostdlib
 lld = $(toolchain)ld.lld
 
 clean:
