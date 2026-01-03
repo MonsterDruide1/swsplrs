@@ -1264,10 +1264,13 @@ impl NSO {
         use std::io::Write;
         let mut file = File::create(path)?;
 
+        writeln!(file, "{{")?;
         for symbol in self.symbol_table.1.iter() {
             let name = self.dynstr_table.get(&(symbol.str_table_offset as u64));
-            writeln!(file, "{}", name.expect(format!("Symbol at {:X} has no name", symbol.value).as_str()))?;
+            writeln!(file, "{};", name.expect(format!("Symbol at {:X} has no name", symbol.value).as_str()))?;
         }
+        writeln!(file, "}};")?;
+
 
         Ok(())
     }

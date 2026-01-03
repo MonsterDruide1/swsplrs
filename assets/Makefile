@@ -22,9 +22,9 @@ assemble:
 	mkdir -p obj
 	bash -c 'for f in asm/*.s; do $(clang) -c -o "obj/$$(basename "$${f%.s}.o")" "$$f"; done'
 link:
-	$(lld) -o myprog obj/*.o -T ../assets/ldscript.lcf -rpath=$PWD -L. -lsdk -lsubsdk0 -lglslc -pie -z now --hash-style=both
+	$(lld) -o myprog obj/*.o -T ../assets/ldscript.lcf -rpath=$PWD -L. -lsdk -lsubsdk0 -lglslc -pie -z now --hash-style=both --dynamic-list=asm/exported_symbols.sym
 linkwithdecomp:
-	$(lld) -o myprog $(shell find ~/OdysseyDecomp/build/CMakeFiles/odyssey.dir -name "*.obj" ! -path "*/al/Library/LiveActor/LiveActorKeeper.cpp.obj" ! -path "*al/Library/Resource/Resource.cpp.obj" ! -path "*Factory.cpp.obj") obj/*.o -T ../assets/ldscript.lcf -rpath=$PWD -L. -lsdk -lsubsdk0 -lglslc -pie -z now --allow-multiple-definition
+	$(lld) -o myprog $(shell find ~/OdysseyDecomp/build/CMakeFiles/odyssey.dir -name "*.obj" ! -path "*/al/Library/LiveActor/LiveActorKeeper.cpp.obj" ! -path "*al/Library/Resource/Resource.cpp.obj" ! -path "*Factory.cpp.obj") obj/*.o -T ../assets/ldscript.lcf -rpath=$PWD -L. -lsdk -lsubsdk0 -lglslc -pie -z now --allow-multiple-definition --dynamic-list=asm/exported_symbols.sym | sed '/warning: duplicate symbol:/,+4d'
 nso:
 	cargo run --manifest-path ~/elf2nso/Cargo.toml myprog -o myprog.un.nso --build-id 3CA12DFAAF9C82DA064D1698DF79CDA100000000000000000000000000000000
 copy:
