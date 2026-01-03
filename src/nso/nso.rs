@@ -1267,7 +1267,11 @@ impl NSO {
         writeln!(file, "{{")?;
         for symbol in self.symbol_table.1.iter() {
             let name = self.dynstr_table.get(&(symbol.str_table_offset as u64));
-            writeln!(file, "{};", name.expect(format!("Symbol at {:X} has no name", symbol.value).as_str()))?;
+            let sym = name.expect(format!("Symbol at {:X} has no name", symbol.value).as_str());
+            if sym.is_empty() {
+                continue;
+            }
+            writeln!(file, "{};", sym)?;
         }
         writeln!(file, "}};")?;
 
