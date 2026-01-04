@@ -333,7 +333,7 @@ impl NSO {
             pb.as_ref().map(|p| p.set_message(format!("Exporting {}", name)));
             // replace trailing `.o` with `.s` if exists, otherwise just append `.s`
             let obj_name = if name.ends_with(".o") { name[..name.len()-2].to_owned() + ".s" } else { name.to_owned() + ".s" };
-            let obj_path = asm_path.join(obj_name);
+            let obj_path = asm_path.join(hacks.get_object_path(&obj_name));
             fs::create_dir_all(obj_path.parent().expect("Failed to get parent directory"))?;
             let mut file = File::create(&obj_path)?;
             self.text.export_object_asm(&obj, &mut file, &references, &helper, &self)?;
@@ -360,7 +360,7 @@ impl NSO {
         for (name, path) in iter {
             pb.as_ref().map(|p| p.set_message(name.clone()));
             let obj_name = if name.ends_with(".o") { name } else { format!("{}.o", name) };
-            self.assemble(&obj_path.join(obj_name), vec![path])?;
+            self.assemble(&obj_path.join(hacks.get_object_path(&obj_name)), vec![path])?;
         }
 
         Ok(())

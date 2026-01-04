@@ -467,5 +467,12 @@ impl Hacks for SMOHacks {
     fn get_jump_tables(&self) -> Vec<(u64, usize)> {
         JUMP_TABLES.to_vec()
     }
+    fn get_object_path(&self, object_name: &str) -> String {
+        if object_name.starts_with("Library") || object_name.starts_with("Project") {
+            format!("lib/al/{}", object_name)
+        } else {
+            format!("src/{}", object_name)
+        }
+    }
 }
 

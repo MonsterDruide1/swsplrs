@@ -90,7 +90,7 @@ fn main() -> anyhow::Result<()> {
 
     if args.objdiff {
         println!("Writing objdiff.json...");
-        objdiff::write_config(std::path::PathBuf::from("out/objdiff.json"), file_list.as_ref().expect("File list not found"))?;
+        objdiff::write_config(std::path::PathBuf::from("out/objdiff.json"), file_list.as_ref().expect("File list not found"), hacks.as_ref().expect("Hacks not found"))?;
         println!("Done.");
     }
 

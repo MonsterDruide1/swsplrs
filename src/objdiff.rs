@@ -2,15 +2,16 @@ use std::path::PathBuf;
 
 use objdiff_core::config::{save_project_config, ProjectConfig, ProjectConfigInfo, ProjectObject};
 
-use crate::file_list::Object;
+use crate::{file_list::Object, hacks::hacks::Hacks};
 
-pub fn write_config(path: PathBuf, file_list: &Vec<(String, Object)>) -> anyhow::Result<()> {
+pub fn write_config(path: PathBuf, file_list: &Vec<(String, Object)>, hacks: &dyn Hacks) -> anyhow::Result<()> {
     // TODO: read all config options everywhere and configure "properly"
     let units = file_list.iter().map(|(name, _)| {
+        let path = hacks.get_object_path(name);
         ProjectObject {
-            name: Some(name.clone()),
-            target_path: Some(format!("out/split/obj/{}", name).into()),
-            base_path: Some(format!("build/CMakeFiles/odyssey.dir/lib/al/{}", name.replace(".o", ".cpp.obj")).into()),
+            name: Some(path.clone()),
+            target_path: Some(format!("out/split/obj/{}", path).into()),
+            base_path: Some(format!("build/CMakeFiles/odyssey.dir/{}", path.replace(".o", ".cpp.obj")).into()),
             ..Default::default()
         }
     }).collect();
