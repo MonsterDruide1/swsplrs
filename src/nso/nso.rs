@@ -404,6 +404,9 @@ impl NSO {
                 return Ok(vec!["__rela_dyn_end".to_string()]);
             }
         }
+        if let Some(init_array_range) = self.sections.get_range(&SectionType::InitArray) && address == init_array_range.start {
+            return Ok(vec!["__init_array_start__".to_string()]);
+        }
         if let Some(init_array_range) = self.sections.get_range(&SectionType::InitArray) && address == init_array_range.end {
             // TODO: figure out how to handle tdata/tbss symbols, which these *actually* mark - not just the end of .init_array
             //  tdata_start, tdata_end, tdata_align_rel,
@@ -887,7 +890,7 @@ impl NSO {
     fn export_bss(&self, path: impl AsRef<Path>, references: &References, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
-        writeln!(file, ".section \".bss\"")?;
+        writeln!(file, ".section \".bssdisas\"")?;  // needs special name so its segment is inserted at the top, before potential decomp objects
         writeln!(file, "")?;
 
         let bss_size = (self.module.bss_end - self.module.bss_start) as u64;

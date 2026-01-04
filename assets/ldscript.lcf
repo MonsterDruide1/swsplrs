@@ -171,6 +171,7 @@ SECTIONS
   HIDDEN(__nx_module_runtime = .);
   .bss : {
     HIDDEN(__bss_start__ = .);
+    *(.bssdisas)
     *(.bss .bss.*)
     *(COMMON)
     . = ALIGN(8);
