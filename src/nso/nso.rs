@@ -972,7 +972,7 @@ impl NSO {
                 let mut alignment = 1;
                 for i in 1..=4 {
                     if data_entry_offset % (1 << i) == 0 {
-                        alignment = 1 << i;
+                        alignment = i;
                     }
                 }
                 if alignment > 1 {
