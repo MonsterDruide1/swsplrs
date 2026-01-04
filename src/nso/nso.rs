@@ -969,6 +969,15 @@ impl NSO {
             // TODO: if outgoing reference, format as .quad
             let data_entry_offset = offset + cursor.position();
             if references.has_references_to(data_entry_offset) {
+                let mut alignment = 1;
+                for i in 1..=4 {
+                    if data_entry_offset % (1 << i) == 0 {
+                        alignment = 1 << i;
+                    }
+                }
+                if alignment > 1 {
+                    writeln!(file, ".align {}", alignment)?;
+                }
                 for symbol in self.get_symbols(data_entry_offset, helper)? {
                     writeln!(file, ".global {}", symbol)?;
                     writeln!(file, "{}:", symbol)?;
