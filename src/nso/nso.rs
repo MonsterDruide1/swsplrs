@@ -890,7 +890,7 @@ impl NSO {
     fn export_bss(&self, path: impl AsRef<Path>, references: &References, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
-        writeln!(file, ".section \".bssdisas\"")?;  // needs special name so its segment is inserted at the top, before potential decomp objects
+        writeln!(file, ".section \".bssdisas\",\"aw\"")?;  // needs special name so its segment is inserted at the top, before potential decomp objects
         writeln!(file, "")?;
 
         let bss_size = (self.module.bss_end - self.module.bss_start) as u64;
