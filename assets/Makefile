@@ -3,7 +3,7 @@ all: clean cxxstubs missingfunctions assemble link nso copy send
 
 toolchain = $(PWD)/../data/
 lld = $(toolchain)ld.lld
-clang = $(toolchain)clang -target aarch64-linux-gnu -nostdlib
+clang = $(toolchain)clang -target aarch64-linux-gnu -nostdlib -fuse-ld=$(lld)
 
 lld = aarch64-linux-gnu-ld
 clang = aarch64-linux-gnu-gcc -nostdlib
@@ -14,7 +14,7 @@ clean:
 	rm myprog.nso || true
 	rm myprog.un.nso || true
 glslc:
-	$(clang) -shared -o libglslc.so -fPIC ../assets/glslcStubs.c -fuse-ld=$(lld)
+	$(clang) -shared -o libglslc.so -fPIC ../assets/glslcStubs.c
 cxxstubs:
 	mkdir -p obj
 	$(clang) -c -o obj/cxxstubs.o ../assets/cxxstubs.c
