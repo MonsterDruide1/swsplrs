@@ -900,17 +900,24 @@ impl NSO {
                 .with_style(ProgressStyle::with_template("{prefix} {wide_bar} {binary_bytes}/{binary_total_bytes}  ").unwrap())
         );
 
+        let mut last_entry_start = 0;
         for i in 0..bss_size {
             pb.as_ref().map(|p| p.inc(1));
 
             let bss_entry_offset = self.module.bss_start as u64 + self.module.header_offset as u64 + i;
             if references.has_references_to(bss_entry_offset) {
+                if last_entry_start != i {
+                    writeln!(file, "\t.skip {}", i - last_entry_start)?;
+                    last_entry_start = i;
+                }
                 for symbol in self.get_symbols(bss_entry_offset, helper)? {
                     writeln!(file, ".global {}", symbol)?;
                     writeln!(file, "{}:", symbol)?;
                 }
             }
-            writeln!(file, "\t.skip 1")?;
+        }
+        if last_entry_start != bss_size {
+            writeln!(file, "\t.skip {}", bss_size - last_entry_start)?;
         }
 
         if let Some(pb) = pb {
