@@ -687,6 +687,8 @@ impl TextSection {
             }
         }
 
+        let eh_cfis = parent.eh_frame.get_cfi_instructions()?;
+
         // TODO .fill {dist}, 1, 0 ???
         while let Some(instr) = iter.next() {
             pb.as_ref().map(|p| p.inc(4));
@@ -698,8 +700,18 @@ impl TextSection {
                     writeln!(file, "{}:", symbol)?;
                 }
             }
+            if let Some(cfi_vec) = eh_cfis.get(&instr.address()) {
+                for cfi in cfi_vec {
+                    writeln!(file, "    {}", cfi)?;
+                }
+            }
 
             self.disassemble_instruction(&instr, &mut file, &cs, references, helper, parent)?;
+        }
+        if let Some(cfi_vec) = eh_cfis.get(&(self.section_offset as u64 + self.section.len() as u64)) {
+            for cfi in cfi_vec {
+                writeln!(file, "    {}", cfi)?;
+            }
         }
 
         if let Some(pb) = pb {

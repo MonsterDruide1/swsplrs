@@ -2,13 +2,15 @@ use std::{collections::{BTreeMap, HashMap, HashSet, VecDeque}, fs::{self, File},
 
 use anyhow::{bail, ensure, Context, Result};
 use binrw::{binread, BinRead, BinReaderExt, NullString};
-use gimli::*;
 use indexmap::IndexSet;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle, ProgressIterator};
 use num_enum::TryFromPrimitive;
 
 use crate::{
-    file_list::Object, hacks::hacks::Hacks, nso::{nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}, section_map::{SectionMap, SectionType}, text::TextSection}, reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References}, utils::call_with_progress
+    file_list::Object, hacks::hacks::Hacks,
+    nso::{eh_frame::EhFrame, nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}, section_map::{SectionMap, SectionType}, text::TextSection},
+    reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References},
+    utils::call_with_progress
 };
 
 pub struct NSO {
@@ -26,6 +28,7 @@ pub struct NSO {
     pub hash_table: HashTable,
     pub gnu_hash_table: GnuHashTable,
     pub embed: Vec<(u64, String)>,  // offset + content
+    pub eh_frame: EhFrame,
 }
 
 impl NSO {
@@ -151,12 +154,12 @@ impl NSO {
         sections.insert_size(file.header.embed_offset as u64 + rodata_off, file.header.embed_size as u64, SectionType::Embed)?;
 
         // .eh_frame_hdr
-        let (_, _, eh_frame_hdr_size) = Self::parse_eh_frame_hdr(
+        let (eh_frame, eh_frame_hdr_size) = EhFrame::parse_eh_frame_hdr(
             &file.memory,
             module.ex_info_start_offset as u64 + module.header_offset as u64,
             &module,
             &text,
-            &sections
+            &sections,
         )?;
         sections.insert_size(
             module.ex_info_start_offset as u64 + module.header_offset as u64,
@@ -199,6 +202,11 @@ impl NSO {
             SectionType::Tbss,  // TODO: figure out what this is - 1e61400 in SMO
         )?;
 
+        println!("Parsed NSO sections:");
+        for (range, section_type) in sections.iter() {
+            println!("  {:<15} {:016X} - {:016X} (size: {:X})", format!("{:?}", section_type), range.start, range.end, range.end - range.start);
+        }
+
         sections.final_check()?;
 
         Ok(NSO {
@@ -216,6 +224,7 @@ impl NSO {
             hash_table,
             gnu_hash_table,
             embed,
+            eh_frame,
         })
     }
 
@@ -597,72 +606,6 @@ impl NSO {
         Ok(strings)
     }
 
-    fn parse_eh_frame_hdr(memory: &[u8], offset: u64, module: &Module, text: &TextSection, sections: &SectionMap) -> anyhow::Result<(BTreeMap<u64, u64>, u64, u64)> {
-        let mut cursor = Cursor::new(&memory[offset as usize ..]);
-        
-        ensure!(cursor.read_le::<u8>()? == 1, "Unsupported eh_frame_hdr version");
-        let eh_frame_ptr_enc = cursor.read_le::<ExceptionHeaderEncoding>()?;
-        let fde_count_enc = cursor.read_le::<ExceptionHeaderEncoding>()?;
-        let table_enc = cursor.read_le::<ExceptionHeaderEncoding>()?;
-
-        let eh_frame_ptr = eh_frame_ptr_enc.read(&mut cursor, offset)?;
-        let fde_count = fde_count_enc.read(&mut cursor, offset)?;
-        
-        let mut binary_search_table = BTreeMap::new();
-        for _ in 0..fde_count {
-            let initial_loc = table_enc.read(&mut cursor, offset)?;
-            let fde_addr = table_enc.read(&mut cursor, offset)?;
-            binary_search_table.insert(initial_loc, fde_addr);
-        }
-
-        Ok((binary_search_table, eh_frame_ptr, cursor.position() as u64))
-
-        /*let eh_frame_hdr_off = module.ex_info_start_offset as u64 + module.header_offset as u64;
-        let bases = BaseAddresses::default()
-            .set_eh_frame_hdr(eh_frame_hdr_off)
-            .set_text(text.section_offset as u64)
-            .set_got(sections.get_range(&SectionType::Got).unwrap().start);
-        let eh_frame_hdr = EhFrameHdr::new(
-            &memory[module.ex_info_start_offset as usize + module.header_offset as usize ..],
-            gimli::LittleEndian
-        ).parse(&bases, 8)?;
-        let bases = BaseAddresses::default()
-            .set_eh_frame_hdr(eh_frame_hdr_off)
-            .set_text(text.section_offset as u64)
-            .set_got(sections.get_range(&SectionType::Got).unwrap().start)
-            .set_eh_frame(eh_frame_hdr.eh_frame_ptr().pointer());
-        let eh_frame = gimli::EhFrame::new(
-            &memory[eh_frame_hdr.eh_frame_ptr().pointer() as usize ..],
-            gimli::LittleEndian
-        );
-        let mut entries = eh_frame.entries(&bases);
-        while let Some(entry) = entries.next()? {
-            match entry {
-                CieOrFde::Cie(cie) => {
-                    println!("CIE: {:?}", cie);
-                    let mut instrs = cie.instructions(&eh_frame, &bases);
-                    while let Some(i) = instrs.next().expect("Can parse next CFI instruction OK") {
-                        println!("{:?}", i);
-                    }
-                }
-                CieOrFde::Fde(partial) => {
-                    let fde = partial
-                        .parse(UnwindSection::cie_from_offset)
-                        .expect("Should be able to get CIE for FDE");
-                    println!("FDE for 0x{:X} - 0x{:X}: {:?}", fde.initial_address(), fde.initial_address() + fde.len(), fde);
-
-                    let mut instrs = fde.instructions(&eh_frame, &bases);
-                    while let Some(i) = instrs.next().expect("Can parse next CFI instruction OK") {
-                        //println!("{:?}", i);
-                    }
-                }
-            }
-        }
-        println!("{:?}", eh_frame_hdr);
-        bail!("end");
-        */
-    }
-
     fn get_references(&self, hacks: &dyn Hacks, m: Option<MultiProgress>) -> anyhow::Result<References> {
         let mut reference_tracker = ReferenceTracker::new();
 
@@ -890,7 +833,7 @@ impl NSO {
     fn export_bss(&self, path: impl AsRef<Path>, references: &References, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
-        writeln!(file, ".section \".bssdisas\",\"aw\"")?;  // needs special name so its segment is inserted at the top, before potential decomp objects
+        writeln!(file, ".section \".bssdisas\",\"aw\",@nobits")?;  // needs special name so its segment is inserted at the top, before potential decomp objects
         writeln!(file, "")?;
 
         let bss_size = (self.module.bss_end - self.module.bss_start) as u64;
@@ -1580,67 +1523,6 @@ pub struct GnuHashTable {
     pub bloom_filter: Vec<u64>,
     pub buckets: Vec<u32>,
     pub chains: Vec<u32>,
-}
-
-// https://refspecs.linuxfoundation.org/LSB_1.3.0/gLSB/gLSB/ehframehdr.html
-#[repr(u8)]
-#[derive(Debug, TryFromPrimitive)]
-pub enum ExceptionHeaderValueFormat {
-    DW_EH_PE_omit = 0xFF,
-    DW_EH_PE_uleb128 = 0x01,
-    DW_EH_PE_udata2 = 0x02,
-    DW_EH_PE_udata4 = 0x03,
-    DW_EH_PE_udata8 = 0x04,
-    DW_EH_PE_sleb128 = 0x09,
-    DW_EH_PE_sdata2 = 0x0A,
-    DW_EH_PE_sdata4 = 0x0B,
-    DW_EH_PE_sdata8 = 0x0C,
-}
-#[repr(u8)]
-#[derive(Debug, TryFromPrimitive)]
-pub enum ExceptionHeaderApplication {
-    DW_EH_PE_absptr = 0x00,
-    DW_EH_PE_pcrel = 0x10,
-    DW_EH_PE_datarel = 0x30,
-    DW_EH_PE_omit = 0xFF,
-}
-
-#[derive(Debug, BinRead)]
-pub struct ExceptionHeaderEncoding {
-    pub value: u8,
-}
-impl ExceptionHeaderEncoding {
-    pub fn get_value_format(&self) -> anyhow::Result<ExceptionHeaderValueFormat> {
-        Ok(ExceptionHeaderValueFormat::try_from(self.value & 0x0F)?)
-    }
-    pub fn get_application(&self) -> anyhow::Result<ExceptionHeaderApplication> {
-        Ok(ExceptionHeaderApplication::try_from(self.value & 0xF0)?)
-    }
-    pub fn read(&self, cursor: &mut Cursor<&[u8]>, hdr_offset: u64) -> anyhow::Result<u64> {
-        use ExceptionHeaderValueFormat::*;
-        use ExceptionHeaderApplication::*;
-
-        let value = match self.get_value_format()? {
-            ExceptionHeaderValueFormat::DW_EH_PE_omit => bail!("DW_EH_PE_omit not supported"),
-            DW_EH_PE_uleb128 => bail!("DW_EH_PE_uleb128 not supported"),
-            DW_EH_PE_udata2 => cursor.read_le::<u16>()? as u64,
-            DW_EH_PE_udata4 => cursor.read_le::<u32>()? as u64,
-            DW_EH_PE_udata8 => cursor.read_le::<u64>()?,
-            DW_EH_PE_sleb128 => bail!("DW_EH_PE_sleb128 not supported"),
-            DW_EH_PE_sdata2 => cursor.read_le::<i16>()? as u64,
-            DW_EH_PE_sdata4 => cursor.read_le::<i32>()? as u64,
-            DW_EH_PE_sdata8 => cursor.read_le::<i64>()? as u64,
-        };
-
-        let value = match self.get_application()? {
-            DW_EH_PE_absptr => value,
-            DW_EH_PE_pcrel => value.wrapping_add(hdr_offset + cursor.position() as u64),
-            DW_EH_PE_datarel => value.wrapping_add(hdr_offset),
-            ExceptionHeaderApplication::DW_EH_PE_omit => bail!("DW_EH_PE_omit not supported"),
-        };
-
-        Ok(value)
-    }
 }
 
 pub struct NsoLookupHelper {

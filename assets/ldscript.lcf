@@ -78,7 +78,10 @@ SECTIONS
     *(.eh_frame_hdr)
     HIDDEN(__eh_frame_hdr_end__ = .);
   } :rodata
-  .eh_frame : { KEEP (*(.eh_frame)) } :rodata
+  .eh_frame : {
+    KEEP (*(.eh_frame))
+    LONG(0)  /* FIXME: force null-terminator for now, might only be alignment? */
+  } :rodata
 
   /* Misc .rodata stuffs (build-id, ect) */
   .note.gnu.build-id : { *(.note.gnu.build-id) } :rodata
