@@ -73,6 +73,10 @@ impl SectionMap {
         }
         Ok(())
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&Range<u64>, &SectionType)> {
+        self.map.iter()
+    }
 }
 
 // list/order from https://github.com/h1k421/GLoat/blob/master/libgloat/application.ld
