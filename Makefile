@@ -34,8 +34,10 @@ out/Makefile: out
 out/libsdk.so: out data/sdk data/nx2elf
 	data/nx2elf data/sdk
 	mv data/sdk.elf out/libsdk.so
+	patchelf --set-soname D:/home/TokyoProject/RedStar/Library/NintendoSDK/NintendoSDK/Libraries/NX-NXFP2-a64/Release/nnSdk.nss out/libsdk.so
 out/libsubsdk0.so: out data/subsdk0 data/nx2elf
 	data/nx2elf data/subsdk0
 	mv data/subsdk0.elf out/libsubsdk0.so
+	patchelf --set-soname D:/home/TokyoProject/RedStar/Library/NintendoSDK/NintendoSDK/Libraries/NX-NXFP2-a64/Release//multimedia.nss out/libsubsdk0.so
 out/libglslc.so: out out/Makefile
 	cd out && make glslc
