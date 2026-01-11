@@ -30,7 +30,7 @@ SECTIONS
 
   /* Trampoline and stuffs */
   __plt_start__ = .;
-  .plt : { *(.plt .plt.*) } :text
+  .plt : SUBALIGN(8) { *(.plt .plt.*) } :text
   __code_end__ = .;
 
   /* Read-only sections */
