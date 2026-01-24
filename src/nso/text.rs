@@ -633,7 +633,7 @@ impl TextSection {
         let mut current_offset = self.section_offset as u64 + self.section.len() as u64;
         let mut current_target = got_plt.start + 0x10;
 
-        for symbol in parent.get_symbols(current_offset, helper)? {
+        for symbol in parent.get_all_symbols(current_offset, helper) {
             writeln!(file, ".global {}", symbol)?;
             writeln!(file, "{}:", symbol)?;
         }
@@ -651,7 +651,7 @@ impl TextSection {
 
         for _ in 3..(got_plt.end-got_plt.start)/8 {
             writeln!(file)?;
-            for symbol in parent.get_symbols(current_offset, helper)? {
+            for symbol in parent.get_all_symbols(current_offset, helper) {
                 writeln!(file, ".global {}", symbol)?;
                 writeln!(file, "{}:", symbol)?;
             }
@@ -695,7 +695,7 @@ impl TextSection {
             if references.has_references_to(instr.address()) {
                 // TODO not always mark as `.global {sym}` (for local branches)
                 writeln!(file, "# 0x{:X}:", instr.address())?;
-                for symbol in parent.get_symbols(instr.address(), helper)? {
+                for symbol in parent.get_all_symbols(instr.address(), helper) {
                     writeln!(file, ".global {}", symbol)?;
                     writeln!(file, "{}:", symbol)?;
                 }
@@ -723,7 +723,6 @@ impl TextSection {
     }
 
     pub fn export_object_asm(&self, obj: &Object, file: &mut File, references: &References, helper: &NsoLookupHelper, parent: &NSO) -> Result<()> {
-        use std::io::Write;
         let cs = construct_capstone()?;
 
         let start = obj.text_section.iter().map(
@@ -739,15 +738,9 @@ impl TextSection {
         // TODO .fill {dist}, 1, 0 ???
         while let Some(instr) = iter.next() {
             if obj.text_section.iter().any(|info| instr.address() == info.offset as u64) {
-                writeln!(file, "# 0x{:X}:", instr.address())?;
-                for symbol in parent.get_symbols(instr.address(), helper)? {
-                    writeln!(file, ".global {}", symbol)?;
-                    writeln!(file, "{}:", symbol)?;
-                }
+                parent.export_symbols_force(instr.address(), file, helper)?;
             } else if references.has_references_to(instr.address()) {
-                for symbol in parent.get_symbols(instr.address(), helper)? {
-                    writeln!(file, ".L{}:", symbol)?;
-                }
+                parent.export_symbols_force(instr.address(), file, helper)?;
             }
 
             self.disassemble_instruction(&instr, file, &cs, references, helper, parent)?;

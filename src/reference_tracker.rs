@@ -28,7 +28,7 @@ pub enum ReferenceSource {
     BL,            // function call
     B_conditional, // conditional branch (local)
     B_tail,        // tail call or local branch
-    Symbol,
+    Symbol(bool),  // symbol from dynamic symbol table - is weak?
     Relocation,    // offset of relocation
     InitArray,     // index of init_array entry
     JumpTableUsage,// set of instructions to load/use jump table
@@ -145,7 +145,6 @@ impl References {
     pub fn has_references_to(&self, target: u64) -> bool {
         self.references_by_target.contains_key(&target)
     }
-
     pub fn get_target_address(&self, source: u64) -> Option<u64> {
         if let Some((_, target)) = self.references_by_source.get(&source) {
             return Some(*target);

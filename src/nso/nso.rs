@@ -375,52 +375,48 @@ impl NSO {
         Ok(())
     }
 
-    pub fn get_symbols(&self, address: u64, helper: &NsoLookupHelper) -> Result<Vec<String>> {
-        // if symbol exists for address, use it
-        if let Some(idxs) = helper.symbol_table_value_to_idx.get(&address) {
-            let mut names = Vec::new();
-            for idx in idxs {
-                let Some(name) = self.dynstr_table.get(&(self.symbol_table.1[*idx].str_table_offset as u64)) else {
-                    bail!("Symbol at {:X} has no name", address);
-                };
-                names.push(name.clone());
-            }
-            return Ok(names);
-        }
+    pub fn get_symbols(&self, address: u64, helper: &NsoLookupHelper) -> Vec<&DynamicSymbol> {
+        let Some(idxs) = helper.symbol_table_value_to_idx.get(&address) else {
+            return vec![];
+        };
+        return idxs.iter().map(|i| &self.symbol_table.1[*i]).collect();
+    }
+
+    pub fn get_fallback_symbol(&self, address: u64) -> String {
         // special case for section start/end addresses (used by _init and _fini)
         if let Some(plt_range) = self.sections.get_range(&SectionType::Plt) && address == plt_range.start {
-            return Ok(vec!["__plt_start__".to_string()]);
+            return "__plt_start__".to_string();
         }
         if let Some(got_plt_range) = self.sections.get_range(&SectionType::GotPlt) && address == got_plt_range.start {
-            return Ok(vec!["__got_start__".to_string()]);
+            return "__got_start__".to_string();
         }
         if let Some(dynamic_range) = self.sections.get_range(&SectionType::Dynamic) && address == dynamic_range.start {
-            return Ok(vec!["__dynamic_start__".to_string()]);
+            return "__dynamic_start__".to_string();
         }
         if let Some(rela_plt_range) = self.sections.get_range(&SectionType::RelaPlt) {
             if rela_plt_range.start == address {
-                return Ok(vec!["__rela_plt_start".to_string()]);
+                return "__rela_plt_start".to_string();
             }
             if rela_plt_range.end == address {
-                return Ok(vec!["__rela_plt_end".to_string()]);
+                return "__rela_plt_end".to_string();
             }
         }
         if let Some(rela_dyn_range) = self.sections.get_range(&SectionType::RelaDyn) {
             if rela_dyn_range.start == address {
-                return Ok(vec!["__rela_dyn_start".to_string()]);
+                return "__rela_dyn_start".to_string();
             }
             if rela_dyn_range.end == address {
-                return Ok(vec!["__rela_dyn_end".to_string()]);
+                return "__rela_dyn_end".to_string();
             }
         }
         if let Some(init_array_range) = self.sections.get_range(&SectionType::InitArray) && address == init_array_range.start {
-            return Ok(vec!["__init_array_start__".to_string()]);
+            return "__init_array_start__".to_string();
         }
         if let Some(init_array_range) = self.sections.get_range(&SectionType::InitArray) && address == init_array_range.end {
             // TODO: figure out how to handle tdata/tbss symbols, which these *actually* mark - not just the end of .init_array
             //  tdata_start, tdata_end, tdata_align_rel,
             //  tbss_start,  tbss_end,  tbss_align_rel
-            return Ok(vec!["__tdata_start__".to_string()]);
+            return "__tdata_start__".to_string();
         }
         // otherwise use `loc_X` for .text or `off_X` for .data/.rodata/.bss
         let prefix = if self.file.is_address_in_segment(address, &NsoSegment::Text) {
@@ -428,13 +424,37 @@ impl NSO {
         } else {
             "off"
         };
-        Ok(vec![format!("{}_{:X}", prefix, address)])
+        format!("{}_{:X}", prefix, address)
     }
 
     pub fn get_any_symbol(&self, address: u64, helper: &NsoLookupHelper) -> Result<String> {
-        let symbols = self.get_symbols(address, helper)?;
-        let item = symbols.into_iter().find(|s| !s.is_empty()).expect(format!("No valid symbol found for address {:X}", address).as_str());
-        Ok(item)
+        let symbols = self.get_symbols(address, helper);
+        if symbols.is_empty() {
+            return Ok(self.get_fallback_symbol(address));
+        }
+
+        let symbol = symbols.into_iter()
+                .map(|s| s.get_name(&self.dynstr_table))
+                .flatten()
+                .find(|s| !s.is_empty())
+                .expect(format!("No valid symbol found for address {:X}", address).as_str());
+        Ok(symbol.clone())
+    }
+
+    // FIXME: usages of this are a sign that something is not properly implemented/handled yet.
+    // either use `get_symbols` for getting details, or use `export_symbols` for exporting on-demand.
+    pub fn get_all_symbols(&self, address: u64, helper: &NsoLookupHelper) -> Vec<String> {
+        let symbols = self.get_symbols(address, helper);
+        if symbols.is_empty() {
+            return vec![self.get_fallback_symbol(address)];
+        }
+        let mut names = Vec::new();
+        for symbol in symbols {
+            if let Ok(name) = symbol.get_name(&self.dynstr_table) {
+                names.push(name.clone());
+            }
+        }
+        names
     }
 
     pub fn get_got_target_symbol(&self, got_address: u64, references: &References, helper: &NsoLookupHelper) -> Result<String> {
@@ -665,6 +685,45 @@ impl NSO {
 
     fn ref_types_symbols(&self, reference_tracker: &mut ReferenceTracker) -> anyhow::Result<()> {
         let (offset, symbols) = &self.symbol_table;
+
+        /*
+        // count how often each symbol.get_visibility() occurs
+        let mut visibility_count: HashMap<DynamicSymbolVisibility, u32> = HashMap::new();
+        for symbol in symbols.iter() {
+            let vis = symbol.get_visibility()?;
+            *visibility_count.entry(vis).or_insert(0) += 1;
+        }
+        println!("Dynamic symbol visibilities:");
+        for (vis, count) in visibility_count.iter() {
+            println!("  {:?}: {}", vis, count);
+        }
+
+        // count how often each symbol.get_type() occurs
+        let mut type_count: HashMap<DynamicSymbolType, u32> = HashMap
+            ::new();
+        for symbol in symbols.iter() {
+            let sym_type = symbol.get_type()?;
+            *type_count.entry(sym_type).or_insert(0) += 1;
+        }
+        println!("Dynamic symbol types:");
+        for (sym_type, count) in type_count.iter() {
+            println!("  {:?}: {}", sym_type, count);
+        }
+
+        // count how often each symbol.binding occurs
+        let mut binding_count: HashMap<DynamicSymbolBind, u32> = HashMap
+            ::new();
+        for symbol in symbols.iter() {
+            let binding = symbol.get_bind()?;
+            *binding_count.entry(binding).or_insert(0) += 1;
+        }
+        println!("Dynamic symbol bindings:");
+        for (binding, count) in binding_count.iter() {
+            println!("  {:?}: {}", binding, count);
+        }
+        bail!("Stopping here for analysis - remove this line to continue");
+        */
+
         for (i, symbol) in symbols.iter().enumerate() {
             if symbol.value == 0 {
                 continue;  // doesn't point to anything within this binary => not interesting
@@ -672,12 +731,13 @@ impl NSO {
             let offset = offset + i as u64 * std::mem::size_of::<DynamicSymbol>() as u64;
             let name = self.dynstr_table.get(&(symbol.str_table_offset as u64));
             let sym_type = symbol.get_type()?;
+            let is_weak = symbol.get_bind()? == DynamicSymbolBind::STB_WEAK;
             match sym_type {
                 DynamicSymbolType::STT_OBJECT => {
-                    reference_tracker.add_reference(symbol.value, ReferenceSource::Symbol, offset, DataRefType::Object(symbol.size));
+                    reference_tracker.add_reference(symbol.value, ReferenceSource::Symbol(is_weak), offset, DataRefType::Object(symbol.size));
                 }
                 DynamicSymbolType::STT_FUNC => {
-                    reference_tracker.add_reference(symbol.value, ReferenceSource::Symbol, offset, DataRefType::Function(symbol.size));
+                    reference_tracker.add_reference(symbol.value, ReferenceSource::Symbol(is_weak), offset, DataRefType::Function(symbol.size));
                 }
                 DynamicSymbolType::STT_NOTYPE => {
                     ensure!(name.is_some_and(|x| x == "end"),
@@ -725,6 +785,30 @@ impl NSO {
                 let target = (jt_target as i64 + offset as i64) as u64;
                 reference_tracker.add_reference(target, ReferenceSource::JumpTable, jt_target + i*4, DataRefType::Code);
             }
+        }
+        Ok(())
+    }
+
+    pub fn export_symbols_force(&self, address: u64, file: &mut File, helper: &NsoLookupHelper) -> anyhow::Result<()> {
+        let symbols = self.get_symbols(address, helper);
+        if symbols.is_empty() {
+            writeln!(file, ".L{}:", self.get_fallback_symbol(address))?;
+            return Ok(());
+        }
+        
+        for symbol in symbols {
+            writeln!(file, "# 0x{:X}:", address)?;
+            let name = symbol.get_name(&self.dynstr_table)?;
+            match(symbol.get_bind()?) {
+                DynamicSymbolBind::STB_WEAK => {
+                    writeln!(file, ".weak {}", name)?;
+                }
+                DynamicSymbolBind::STB_GLOBAL => {
+                    writeln!(file, ".global {}", name)?;
+                }
+                _ => unreachable!("Unsupported symbol binding: {:?}", symbol.get_bind()?),
+            }
+            writeln!(file, "{}:", name)?;
         }
         Ok(())
     }
@@ -853,7 +937,7 @@ impl NSO {
                     writeln!(file, "\t.skip {}", i - last_entry_start)?;
                     last_entry_start = i;
                 }
-                for symbol in self.get_symbols(bss_entry_offset, helper)? {
+                for symbol in self.get_all_symbols(bss_entry_offset, helper) {
                     writeln!(file, ".global {}", symbol)?;
                     writeln!(file, "{}:", symbol)?;
                 }
@@ -921,7 +1005,7 @@ impl NSO {
                 if alignment > 1 {
                     writeln!(file, ".align {}", alignment)?;
                 }
-                for symbol in self.get_symbols(data_entry_offset, helper)? {
+                for symbol in self.get_all_symbols(data_entry_offset, helper) {
                     writeln!(file, ".global {}", symbol)?;
                     writeln!(file, "{}:", symbol)?;
                 }
@@ -1212,7 +1296,7 @@ impl NSO {
         writeln!(file, ".section \".embed\", \"a\"")?;
 
         for (offset, value) in self.embed.iter() {
-            for symbol in self.get_symbols(*offset, helper)? {
+            for symbol in self.get_all_symbols(*offset, helper) {
                 writeln!(file, ".global {}", symbol)?;
                 writeln!(file, "{}:", symbol)?;
             }
@@ -1341,9 +1425,7 @@ impl NSO {
             writeln!(file, ".section {}, \"a\"", section_name)?;
             writeln!(file, "")?;
             for &(target, end_of_target) in chunk {
-                for symbol in self.get_symbols(target, helper)? {
-                    writeln!(file, "{}:", symbol)?;
-                }
+                self.export_symbols_force(target, file, helper)?;
                 for t in target..end_of_target {
                     match section {
                         ReferencedSectionType::Bss => writeln!(file, "\t.skip 1")?,
@@ -1435,6 +1517,9 @@ impl DynamicSymbol {
     }
     pub fn get_visibility(&self) -> anyhow::Result<DynamicSymbolVisibility> {
         Ok(DynamicSymbolVisibility::try_from(self.other & 0x03)?)
+    }
+    pub fn get_name<'a>(&self, dynstr_table: &'a BTreeMap<u64, String>) -> anyhow::Result<&'a String> {
+        dynstr_table.get(&(self.str_table_offset as u64)).ok_or_else(|| anyhow::anyhow!("Symbol at value {:X} has no name", self.value))
     }
 }
 
