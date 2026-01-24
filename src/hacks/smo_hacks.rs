@@ -457,6 +457,15 @@ const JUMP_TABLES: [(u64, usize); 454] = [
     (0x01987c54, 8),
 ];
 
+const RODATA_SUBSECTIONS: [(u64, u64, &'static str); 6] = [
+    (0x0181C3E0, 0x0187FC64, ".rodata.str1.1"),
+    (0x0187FC64, 0x01880A10, ".rodata.cst4"),
+    (0x01886830, 0x01886B30, ".rodata.cst8"),
+    (0x018874E0, 0x01887870, ".rodata.cst16"),
+    (0x018ACFBC, 0x018AD1C0, ".rodata.str2.2"),
+    (0x018F5AC8, 0x018F5AE4, ".rodata.str4.4"),
+];
+
 pub struct SMOHacks {}
 impl SMOHacks {
     pub fn new() -> anyhow::Result<Self> {
@@ -473,6 +482,9 @@ impl Hacks for SMOHacks {
         } else {
             format!("src/{}", object_name)
         }
+    }
+    fn get_rodata_subsections(&self) -> Vec<(u64, u64, &'static str)> {
+        RODATA_SUBSECTIONS.to_vec()
     }
 }
 

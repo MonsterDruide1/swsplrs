@@ -346,7 +346,7 @@ impl NSO {
             fs::create_dir_all(obj_path.parent().expect("Failed to get parent directory"))?;
             let mut file = File::create(&obj_path)?;
             self.text.export_object_asm(&obj, &mut file, &references, &helper, &self)?;
-            self.export_referenced_data(&obj, &mut file, &references, &helper).context(format!("In file {}", obj_path.display()))?;
+            self.export_referenced_data(&obj, &mut file, &references, &helper, hacks).context(format!("In file {}", obj_path.display()))?;
             asm_files.push((name.clone(), obj_path));
         }
 
@@ -1241,7 +1241,7 @@ impl NSO {
         Ok(())
     }
 
-    fn export_referenced_data(&self, obj: &Object, file: &mut File, references: &References, helper: &NsoLookupHelper) -> Result<()> {
+    fn export_referenced_data(&self, obj: &Object, file: &mut File, references: &References, helper: &NsoLookupHelper, hacks: &dyn Hacks) -> Result<()> {
         let text_start = obj.text_section.iter().map(
             |info| info.offset as usize
         ).min().ok_or_else(|| anyhow::anyhow!("Object has no text section entries"))?;
@@ -1293,48 +1293,64 @@ impl NSO {
             }
         }
 
+        #[derive(Debug, Eq, PartialEq, Hash)]
+        enum ReferencedSectionType {
+            Rodata(&'static str),
+            Data,
+            Bss,
+            Embed,
+        }
+
         refs.sort_by_cached_key(|(s, _)| *s);
+
         let mut chunks = HashMap::new();
+        let rodata_subsections = hacks.get_rodata_subsections();
         for (_, target) in refs.into_iter() {
-            chunks.entry(self.sections.get(target).expect("Target address not in any section")).or_insert_with(IndexSet::new).insert(target);
+            let section = self.sections.get(target).expect("Target address not in any section");
+            let ref_section = match section {
+                SectionType::Rodata => {
+                    rodata_subsections.iter().find_map(|&(start, end, name)| {
+                        if target >= start && target < end {
+                            Some(ReferencedSectionType::Rodata(name))
+                        } else {
+                            None
+                        }
+                    }).unwrap_or_else(|| ReferencedSectionType::Rodata(".rodata"))
+                },
+                SectionType::Data => ReferencedSectionType::Data,
+                SectionType::Bss => ReferencedSectionType::Bss,
+                SectionType::Embed => ReferencedSectionType::Embed,
+                SectionType::Plt | SectionType::Text => {continue;}    // ignore, just used to properly resolve calls
+                SectionType::Got | SectionType::GotPlt => {continue;}  // imported from other objects or libraries
+                _ => bail!("Unhandled referenced data while exporting in section {:?}", section),
+            };
+            let end_of_section = self.sections.get_range(section).expect("Section does not exist").end;
+            let end_of_target = (target + 1..end_of_section).find(|t| references.has_references_to(*t)).unwrap_or(end_of_section);
+            chunks.entry(ref_section).or_insert_with(IndexSet::new).insert((target, end_of_target));
         }
 
         for (section, chunk) in &chunks {
-            let end_of_section = self.sections.get_range(section).expect("Section does not exist").end;
-            match section {
-                SectionType::Rodata | SectionType::Data | SectionType::Bss | SectionType::Embed => {
-                    let section_name = match section {
-                        SectionType::Rodata => ".rodata",
-                        SectionType::Data => ".data",
-                        SectionType::Bss => ".bss",
-                        SectionType::Embed => ".embed",
-                        _ => unreachable!()
-                    };
-                    writeln!(file, "")?;
-                    writeln!(file, "")?;
-                    writeln!(file, ".section {}, \"a\"", section_name)?;
-                    writeln!(file, "")?;
-                    for &target in chunk {
-                        let end_of_target = (target + 1..end_of_section).find(|t| references.has_references_to(*t)).unwrap_or(end_of_section);
-
-                        for symbol in self.get_symbols(target, helper)? {
-                            writeln!(file, "{}:", symbol)?;
-                        }
-                        for t in target..end_of_target {
-                            match section {
-                                SectionType::Bss => writeln!(file, "\t.skip 1")?,
-                                SectionType::Rodata | SectionType::Data | SectionType::Embed => writeln!(file, "\t.byte 0x{:02X}", self.file.memory[t as usize])?,
-                                _ => unreachable!()
-                            }
-                        }
-                        writeln!(file, "")?;
+            let section_name = match section {
+                ReferencedSectionType::Rodata(s) => s,
+                ReferencedSectionType::Data => ".data",
+                ReferencedSectionType::Bss => ".bss",
+                ReferencedSectionType::Embed => ".embed",
+            };
+            writeln!(file, "")?;
+            writeln!(file, "")?;
+            writeln!(file, ".section {}, \"a\"", section_name)?;
+            writeln!(file, "")?;
+            for &(target, end_of_target) in chunk {
+                for symbol in self.get_symbols(target, helper)? {
+                    writeln!(file, "{}:", symbol)?;
+                }
+                for t in target..end_of_target {
+                    match section {
+                        ReferencedSectionType::Bss => writeln!(file, "\t.skip 1")?,
+                        _ => writeln!(file, "\t.byte 0x{:02X}", self.file.memory[t as usize])?,
                     }
                 }
-                SectionType::Plt | SectionType::Text => {}    // ignore, just used to properly resolve calls
-                SectionType::Got | SectionType::GotPlt => {}  // imported from other objects or libraries
-                _ => {
-                    bail!("Unhandled referenced data while exporting in section {:?}: {:?}", section, chunk);
-                }
+                writeln!(file, "")?;
             }
         }
 
