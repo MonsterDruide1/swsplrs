@@ -746,7 +746,7 @@ impl TextSection {
                 }
             } else if references.has_references_to(instr.address()) {
                 for symbol in parent.get_symbols(instr.address(), helper)? {
-                    writeln!(file, "{}:", symbol)?;
+                    writeln!(file, ".L{}:", symbol)?;
                 }
             }
 
