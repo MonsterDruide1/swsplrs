@@ -1369,9 +1369,13 @@ impl NSO {
                 };
                 match section {
                     SectionType::Rodata | SectionType::Data => {
+                        // add references from entire chunk, as data is not necessarily only one entry (example: vtable/typeinfo/...)
+                        let end_of_section = self.sections.get_range(section).expect("Section does not exist").end;
+                        let end_of_target = (target + 1..end_of_section).find(|t| references.has_references_to(*t)).unwrap_or(end_of_section);
+                        for t in target..end_of_target {
+                            unhandled_sources.push_back(t);
+                        }
                         refs.push((source, target));
-                        unhandled_sources.push_back(target);
-                        // TODO: potentially add more references, as data is not necessarily only one entry (example: vtable/typeinfo/...)
                     }
                     SectionType::Bss | SectionType::Embed => {
                         refs.push((source, target));
@@ -1379,12 +1383,7 @@ impl NSO {
                     SectionType::Got => {
                         unhandled_sources.push_back(target);
                     }
-                    SectionType::Dynsym => {
-                        ensure!(self.sections.get(source) == Some(&SectionType::Got),
-                            "Reference from {:?} at {:X} to dynsym at {:X} unexpected",
-                            self.sections.get(source), source, target
-                        );
-                    }
+                    SectionType::Dynsym => continue,  // imported from other objects or libraries
                     SectionType::Plt | SectionType::Text => continue,    // ignore, just used to properly resolve calls
                     SectionType::GotPlt => continue,  // imported from other objects or libraries
                     _ => {
