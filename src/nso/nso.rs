@@ -976,6 +976,132 @@ impl NSO {
         )
     }
 
+    fn export_data_entry(&self, file: &mut File, cursor: &mut Cursor<&[u8]>, section_offset: u64, references: &References, helper: &NsoLookupHelper) -> anyhow::Result<()> {
+        use std::io::Write;
+
+        let data_entry_offset = section_offset + cursor.position();
+        if let Some(target) = references.get_target_address(data_entry_offset) {
+            match references.get_type_of(target) {
+                None => bail!("Reference at {:X} points to {:X}, but target has no type", data_entry_offset, target),
+                Some(DataRefType::SymbolAbsolute(addend)) => {
+                    let data = cursor.read_le::<i64>()?;
+                    ensure!(data == addend, "Reference at {:X} points to {:X} + {}, but data is {:X}", data_entry_offset, target, addend, data);
+                    let target_symbol_idx = (target - self.symbol_table.0) / std::mem::size_of::<DynamicSymbol>() as u64;
+                    let Some(name) = self.dynstr_table.get(&(self.symbol_table.1[target_symbol_idx as usize].str_table_offset as u64)) else {
+                        bail!("Symbol at index {:X} has no name", target);
+                    };
+                    writeln!(file, "\t.quad {}+{}", name, addend)?;
+                }
+                Some(DataRefType::Code) => {
+                    if let Some(data_type) = references.get_type_of(data_entry_offset) && let DataRefType::JumpTable(size) = data_type {
+                        for _ in 0..size {
+                            let offset = cursor.read_le::<i32>()?;
+                            let target = (data_entry_offset as i64 + offset as i64) as u64;
+                            writeln!(file, "\t.word {} - {}", self.get_any_symbol(target, helper)?, self.get_any_symbol(data_entry_offset, helper)?)?;
+                        }
+                    } else {
+                        let data = cursor.read_le::<u64>()?;
+                        ensure!(data == target, "Reference at {:X} points to {:X}, but data is {:X} (type: {:?})", data_entry_offset, target, data, references.get_type_of(data_entry_offset));
+                        // references are either objects (by symbols), unknown (by references) or int64 (by 64-bit loads)
+                        ensure!(references.get_type_of(data_entry_offset).is_none_or(|x| matches!(x, DataRefType::Object(_) | DataRefType::Unknown | DataRefType::Int64)),
+                            "Reference at {:X} points to {:X}, but is not marked as object. Instead: {:?}", data_entry_offset, target, references.get_type_of(data_entry_offset)
+                        );
+                        writeln!(file, "\t.quad {}", self.get_any_symbol(target, helper)?)?;
+                    }
+                }
+                Some(_) => {
+                    let data = cursor.read_le::<u64>()?;
+                    ensure!(data == target, "Reference at {:X} points to {:X}, but data is {:X}", data_entry_offset, target, data);
+                    // references are either objects (by symbols), unknown (by references) or int64 (by 64-bit loads)
+                    ensure!(references.get_type_of(data_entry_offset).is_none_or(|x| matches!(x, DataRefType::Object(_) | DataRefType::Unknown | DataRefType::Int64)),
+                        "Reference at {:X} points to {:X}, but is not marked as object. Instead: {:?}", data_entry_offset, target, references.get_type_of(data_entry_offset)
+                    );
+                    writeln!(file, "\t.quad {}", self.get_any_symbol(target, helper)?)?;
+                }
+            }
+        } else if let Some(data_type) = references.get_type_of(data_entry_offset) {
+            match data_type {
+                DataRefType::Int8 => writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?,
+                DataRefType::Int16 => writeln!(file, "\t.short 0x{:04X}", cursor.read_le::<u16>()?)?,
+                DataRefType::Int32 => writeln!(file, "\t.word 0x{:08X}", cursor.read_le::<u32>()?)?,
+                DataRefType::Int64 => writeln!(file, "\t.quad 0x{:016X}", cursor.read_le::<u64>()?)?,
+                DataRefType::Float32 => {
+                    // TODO: currently broken because clang does not like FLOAT_MAX as value
+                    let val = cursor.read_le::<f32>()?;
+                    cursor.seek_relative(-4)?; // go back to re-read the bytes
+                    writeln!(file, "\t.word {}  // float: {}", cursor.read_le::<u32>()?, val)?;
+                    /*let val = cursor.read_le::<f32>()?;
+                    if !val.is_finite() {
+                        cursor.seek_relative(-4)?; // go back to re-read the bytes
+                        writeln!(file, "\t.word {}  // float: {}", cursor.read_le::<u32>()?, val)?;
+                    } else {
+                        writeln!(file, "\t.float {}", val)?;
+                    }*/
+                }
+                DataRefType::Float64 => {
+                    // TODO: currently broken because clang does not like DOUBLE_MAX as value
+                    let val = cursor.read_le::<f64>()?;
+                    cursor.seek_relative(-8)?; // go back to re-read the bytes
+                    writeln!(file, "\t.quad {}  // double: {}", cursor.read_le::<u64>()?, val)?;
+                    /*let val = cursor.read_le::<f64>()?;
+                    if !val.is_finite() {
+                        cursor.seek_relative(-8)?; // go back to re-read the bytes
+                        writeln!(file, "\t.quad {}  // double: {}", cursor.read_le::<u64>()?, val)?;
+                    } else {
+                        writeln!(file, "\t.double {}", val)?;
+                    }*/
+                }
+                DataRefType::Float128 => {
+                    for _ in 0..16 {
+                        writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?;
+                    }
+                }
+                // TODO: there's more information in Object(size), but potentially references to data within the object
+                DataRefType::Object(_) => writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?,
+                DataRefType::Unknown => writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?,
+                _ => bail!("Unsupported data reference type {:?}", data_type),
+            }
+        } else {
+            writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?;
+        }
+
+        Ok(())
+    }
+
+    fn export_data_chunk(&self, file: &mut File, cursor: &mut Cursor<&[u8]>, length: u64, section_offset: u64, references: &References, helper: &NsoLookupHelper) -> anyhow::Result<()> {
+        let start = cursor.position();
+        let end = start + length;
+        
+        // ensure that we won't skip any references
+        for skipped_off in (start+1)..end {
+            if references.has_references_to(skipped_off + section_offset) {
+                bail!("Missed reference to {:X} when exporting chunk {:X}..{:X}", skipped_off + section_offset, start + section_offset, end + section_offset);
+            }
+        }
+
+        // export symbol for current chunk
+        let mut alignment = 1;
+        for i in 1..=4 {
+            if (start+section_offset) % (1 << i) == 0 {
+                alignment = i;
+            }
+        }
+        if alignment > 1 {
+            writeln!(file, ".align {}", alignment)?;
+        }
+        for symbol in self.get_all_symbols(start + section_offset, helper) {
+            writeln!(file, ".global {}", symbol)?;
+            writeln!(file, "{}:", symbol)?;
+        }
+        
+        while cursor.position() < end {
+            self.export_data_entry(file, cursor, section_offset, references, helper)?;
+        }
+        ensure!(cursor.position() == end, "Cursor position after exporting chunk {:X}..{:X} is {:X}", start + section_offset, end + section_offset, cursor.position() + section_offset);
+
+        Ok(())
+    }
+
     fn export_data_section(&self, path: impl AsRef<Path>, name: &str, perms: &str, memory: &[u8], size: u64, offset: u64, references: &References, helper: &NsoLookupHelper, m: &Option<MultiProgress>) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
@@ -991,119 +1117,10 @@ impl NSO {
         let mut cursor = Cursor::new(&memory[offset as usize..(offset as usize + size as usize)]);
         while cursor.position() < size {
             pb.as_ref().map(|p| p.set_position(cursor.position()));
-            let cursor_pos = cursor.position();
-            
-            // TODO: if outgoing reference, format as .quad
-            let data_entry_offset = offset + cursor.position();
-            if references.has_references_to(data_entry_offset) {
-                let mut alignment = 1;
-                for i in 1..=4 {
-                    if data_entry_offset % (1 << i) == 0 {
-                        alignment = i;
-                    }
-                }
-                if alignment > 1 {
-                    writeln!(file, ".align {}", alignment)?;
-                }
-                for symbol in self.get_all_symbols(data_entry_offset, helper) {
-                    writeln!(file, ".global {}", symbol)?;
-                    writeln!(file, "{}:", symbol)?;
-                }
-            }
-            if let Some(target) = references.get_target_address(data_entry_offset) {
-                match references.get_type_of(target) {
-                    None => bail!("Reference at {:X} points to {:X}, but target has no type", data_entry_offset, target),
-                    Some(DataRefType::SymbolAbsolute(addend)) => {
-                        let data = cursor.read_le::<i64>()?;
-                        ensure!(data == addend, "Reference at {:X} points to {:X} + {}, but data is {:X}", data_entry_offset, target, addend, data);
-                        let target_symbol_idx = (target - self.symbol_table.0) / std::mem::size_of::<DynamicSymbol>() as u64;
-                        let Some(name) = self.dynstr_table.get(&(self.symbol_table.1[target_symbol_idx as usize].str_table_offset as u64)) else {
-                            bail!("Symbol at index {:X} has no name", target);
-                        };
-                        writeln!(file, "\t.quad {}+{}", name, addend)?;
-                    }
-                    Some(DataRefType::Code) => {
-                        if let Some(data_type) = references.get_type_of(data_entry_offset) && let DataRefType::JumpTable(size) = data_type {
-                            for _ in 0..size {
-                                let offset = cursor.read_le::<i32>()?;
-                                let target = (data_entry_offset as i64 + offset as i64) as u64;
-                                writeln!(file, "\t.word {} - {}", self.get_any_symbol(target, helper)?, self.get_any_symbol(data_entry_offset, helper)?)?;
-                            }
-                        } else {
-                            let data = cursor.read_le::<u64>()?;
-                            ensure!(data == target, "Reference at {:X} points to {:X}, but data is {:X} (type: {:?})", data_entry_offset, target, data, references.get_type_of(data_entry_offset));
-                            // references are either objects (by symbols), unknown (by references) or int64 (by 64-bit loads)
-                            ensure!(references.get_type_of(data_entry_offset).is_none_or(|x| matches!(x, DataRefType::Object(_) | DataRefType::Unknown | DataRefType::Int64)),
-                                "Reference at {:X} points to {:X}, but is not marked as object. Instead: {:?}", data_entry_offset, target, references.get_type_of(data_entry_offset)
-                            );
-                            writeln!(file, "\t.quad {}", self.get_any_symbol(target, helper)?)?;
-                        }
-                    }
-                    Some(_) => {
-                        let data = cursor.read_le::<u64>()?;
-                        ensure!(data == target, "Reference at {:X} points to {:X}, but data is {:X}", data_entry_offset, target, data);
-                        // references are either objects (by symbols), unknown (by references) or int64 (by 64-bit loads)
-                        ensure!(references.get_type_of(data_entry_offset).is_none_or(|x| matches!(x, DataRefType::Object(_) | DataRefType::Unknown | DataRefType::Int64)),
-                            "Reference at {:X} points to {:X}, but is not marked as object. Instead: {:?}", data_entry_offset, target, references.get_type_of(data_entry_offset)
-                        );
-                        writeln!(file, "\t.quad {}", self.get_any_symbol(target, helper)?)?;
-                    }
-                }
-            } else if let Some(data_type) = references.get_type_of(data_entry_offset) {
-                match data_type {
-                    DataRefType::Int8 => writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?,
-                    DataRefType::Int16 => writeln!(file, "\t.short 0x{:04X}", cursor.read_le::<u16>()?)?,
-                    DataRefType::Int32 => writeln!(file, "\t.word 0x{:08X}", cursor.read_le::<u32>()?)?,
-                    DataRefType::Int64 => writeln!(file, "\t.quad 0x{:016X}", cursor.read_le::<u64>()?)?,
-                    DataRefType::Float32 => {
-                        // TODO: currently broken because clang does not like FLOAT_MAX as value
-                        let val = cursor.read_le::<f32>()?;
-                        cursor.seek_relative(-4)?; // go back to re-read the bytes
-                        writeln!(file, "\t.word {}  // float: {}", cursor.read_le::<u32>()?, val)?;
-                        /*let val = cursor.read_le::<f32>()?;
-                        if !val.is_finite() {
-                            cursor.seek_relative(-4)?; // go back to re-read the bytes
-                            writeln!(file, "\t.word {}  // float: {}", cursor.read_le::<u32>()?, val)?;
-                        } else {
-                            writeln!(file, "\t.float {}", val)?;
-                        }*/
-                    }
-                    DataRefType::Float64 => {
-                        // TODO: currently broken because clang does not like DOUBLE_MAX as value
-                        let val = cursor.read_le::<f64>()?;
-                        cursor.seek_relative(-8)?; // go back to re-read the bytes
-                        writeln!(file, "\t.quad {}  // double: {}", cursor.read_le::<u64>()?, val)?;
-                        /*let val = cursor.read_le::<f64>()?;
-                        if !val.is_finite() {
-                            cursor.seek_relative(-8)?; // go back to re-read the bytes
-                            writeln!(file, "\t.quad {}  // double: {}", cursor.read_le::<u64>()?, val)?;
-                        } else {
-                            writeln!(file, "\t.double {}", val)?;
-                        }*/
-                    }
-                    DataRefType::Float128 => {
-                        for _ in 0..16 {
-                            writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?;
-                        }
-                    }
-                    // TODO: there's more information in Object(size), but potentially references to data within the object
-                    DataRefType::Object(_) => writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?,
-                    DataRefType::Unknown => writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?,
-                    _ => bail!("Unsupported data reference type {:?}", data_type),
-                }
-            } else {
-                writeln!(file, "\t.byte 0x{:02X}", cursor.read_le::<u8>()?)?;
-            }
-
-            // ensure that we didn't skip any references
-            if (cursor_pos+1) < cursor.position() {
-                for skipped_off in (cursor_pos+1)..cursor.position() {
-                    let skipped_data_entry_offset = offset + skipped_off;
-                    if let Some(skipped_data_type) = references.get_type_of(skipped_data_entry_offset) {
-                        bail!("Missed reference to {:X} of type {:?} in {} - currently at {:X}", skipped_data_entry_offset, skipped_data_type, name, cursor.position()+offset);
-                    }
-                }
-            }
+            //self.export_data_entry(&mut file, &mut cursor, offset, references, helper)?;
+            let start = cursor.position();
+            let end = (cursor.position() + 1..size).find(|t| references.has_references_to(*t + offset)).unwrap_or(size);
+            self.export_data_chunk(&mut file, &mut cursor, end - start, offset, references, helper)?;
         }
 
         if let Some(pb) = pb {
@@ -1425,11 +1442,11 @@ impl NSO {
             writeln!(file, ".section {}, \"a\"", section_name)?;
             writeln!(file, "")?;
             for &(target, end_of_target) in chunk {
-                self.export_symbols_force(target, file, helper)?;
-                for t in target..end_of_target {
-                    match section {
-                        ReferencedSectionType::Bss => writeln!(file, "\t.skip 1")?,
-                        _ => writeln!(file, "\t.byte 0x{:02X}", self.file.memory[t as usize])?,
+                match section {
+                    ReferencedSectionType::Bss => writeln!(file, "\t.skip {}", end_of_target - target)?,
+                    _ => {
+                        let mut cursor = Cursor::new(&self.file.memory[target as usize..end_of_target as usize]);
+                        self.export_data_chunk(file, &mut cursor, end_of_target - target, target, references, helper)?;
                     }
                 }
                 writeln!(file, "")?;
