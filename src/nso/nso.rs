@@ -1436,9 +1436,15 @@ impl NSO {
                 ReferencedSectionType::Bss => ".bss",
                 ReferencedSectionType::Embed => ".embed",
             };
+            let perms = match section {
+                ReferencedSectionType::Rodata(_) => "\"a\"",
+                ReferencedSectionType::Data => "\"aw\"",
+                ReferencedSectionType::Bss => "\"aw\",@nobits",
+                ReferencedSectionType::Embed => "\"a\"",
+            };
             writeln!(file, "")?;
             writeln!(file, "")?;
-            writeln!(file, ".section {}, \"a\"", section_name)?;
+            writeln!(file, ".section {}, {}", section_name, perms)?;
             writeln!(file, "")?;
             for &(target, end_of_target) in chunk {
                 match section {
