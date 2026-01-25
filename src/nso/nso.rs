@@ -1068,7 +1068,7 @@ impl NSO {
         Ok(())
     }
 
-    fn export_data_chunk(&self, file: &mut File, cursor: &mut Cursor<&[u8]>, length: u64, section_offset: u64, references: &References, helper: &NsoLookupHelper) -> anyhow::Result<()> {
+    fn export_data_chunk(&self, file: &mut File, cursor: &mut Cursor<&[u8]>, length: u64, section_offset: u64, align: bool, references: &References, helper: &NsoLookupHelper) -> anyhow::Result<()> {
         let start = cursor.position();
         let end = start + length;
         
@@ -1080,14 +1080,16 @@ impl NSO {
         }
 
         // export symbol for current chunk
-        let mut alignment = 1;
-        for i in 1..=4 {
-            if (start+section_offset) % (1 << i) == 0 {
-                alignment = i;
+        if align {
+            let mut alignment = 1;
+            for i in 1..=4 {
+                if (start+section_offset) % (1 << i) == 0 {
+                    alignment = i;
+                }
             }
-        }
-        if alignment > 1 {
-            writeln!(file, ".align {}", alignment)?;
+            if alignment > 1 {
+                writeln!(file, ".align {}", alignment)?;
+            }
         }
         for symbol in self.get_all_symbols(start + section_offset, helper) {
             writeln!(file, ".global {}", symbol)?;
@@ -1120,7 +1122,7 @@ impl NSO {
             //self.export_data_entry(&mut file, &mut cursor, offset, references, helper)?;
             let start = cursor.position();
             let end = (cursor.position() + 1..size).find(|t| references.has_references_to(*t + offset)).unwrap_or(size);
-            self.export_data_chunk(&mut file, &mut cursor, end - start, offset, references, helper)?;
+            self.export_data_chunk(&mut file, &mut cursor, end - start, offset, true, references, helper)?;
         }
 
         if let Some(pb) = pb {
@@ -1451,7 +1453,7 @@ impl NSO {
                     ReferencedSectionType::Bss => writeln!(file, "\t.skip {}", end_of_target - target)?,
                     _ => {
                         let mut cursor = Cursor::new(&self.file.memory[target as usize..end_of_target as usize]);
-                        self.export_data_chunk(file, &mut cursor, end_of_target - target, target, references, helper)?;
+                        self.export_data_chunk(file, &mut cursor, end_of_target - target, target, false, references, helper)?;
                     }
                 }
                 writeln!(file, "")?;
