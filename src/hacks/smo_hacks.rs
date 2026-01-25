@@ -458,7 +458,7 @@ const JUMP_TABLES: [(u64, usize); 454] = [
 ];
 
 const RODATA_SUBSECTIONS: [(u64, u64, &'static str); 6] = [
-    (0x0181C3E0, 0x0187FC64, ".rodata.str1.1"),
+    (0x0181C3E0, 0x0187FB60, ".rodata.str1.1"),
     (0x0187FC64, 0x01880A10, ".rodata.cst4"),
     (0x01886830, 0x01886B30, ".rodata.cst8"),
     (0x018874E0, 0x01887870, ".rodata.cst16"),
