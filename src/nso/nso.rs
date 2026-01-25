@@ -790,9 +790,17 @@ impl NSO {
     }
 
     pub fn export_symbols_force(&self, address: u64, file: &mut File, helper: &NsoLookupHelper) -> anyhow::Result<()> {
+        self.export_symbols_force_nonlocal(address, false, file, helper)
+    }
+    pub fn export_symbols_force_nonlocal(&self, address: u64, non_local: bool, file: &mut File, helper: &NsoLookupHelper) -> anyhow::Result<()> {
         let symbols = self.get_symbols(address, helper);
         if symbols.is_empty() {
-            writeln!(file, ".L{}:", self.get_fallback_symbol(address))?;
+            if non_local {
+                writeln!(file, ".global {}", self.get_fallback_symbol(address))?;
+                writeln!(file, "{}:", self.get_fallback_symbol(address))?;
+            } else {
+                writeln!(file, ".L{}:", self.get_fallback_symbol(address))?;
+            }
             return Ok(());
         }
         

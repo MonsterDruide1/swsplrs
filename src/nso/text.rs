@@ -738,7 +738,7 @@ impl TextSection {
         // TODO .fill {dist}, 1, 0 ???
         while let Some(instr) = iter.next() {
             if obj.text_section.iter().any(|info| instr.address() == info.offset as u64) {
-                parent.export_symbols_force(instr.address(), file, helper)?;
+                parent.export_symbols_force_nonlocal(instr.address(), true, file, helper)?;
             } else if references.has_references_to(instr.address()) {
                 parent.export_symbols_force(instr.address(), file, helper)?;
             }
