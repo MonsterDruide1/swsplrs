@@ -1,8 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::{collections::{HashMap, HashSet}, fs, path::Path};
 use anyhow::{Result, ensure};
+use indicatif::MultiProgress;
+use rkyv::{Archive, Deserialize, Serialize, rancor};
+
+use crate::{hacks::hacks::Hacks, nso::nso::NSO};
 
 // top/low = most specific. If conflicts are found, the lower value (more specific) is used.
-#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Archive, Serialize, Deserialize)]
 pub enum DataRefType {
     Object(u64),     // size in bytes
     Function(u64),   // size in bytes
@@ -20,7 +24,8 @@ pub enum DataRefType {
     SymbolAbsolute(i64), // absolute address, addend
     Unknown,
 }
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Hash, Eq, PartialEq))]
 pub enum ReferenceSource {
     ADRP,          // adrp
     ADD(bool),     // add to adrp - source already offset by adrp+add? (=> conflicts = destroy references)
@@ -131,6 +136,7 @@ impl ReferenceTracker {
     }
 }
 
+#[derive(Archive, Serialize, Deserialize)]
 pub struct References {
     references_by_target: HashMap<u64, (DataRefType, HashSet<ReferenceSource>)>,  // target -> (type, sources)
     references_by_source: HashMap<u64, (ReferenceSource, u64)>,
@@ -151,4 +157,32 @@ impl References {
         }
         None
     }
+}
+
+pub fn get_references(nso: &NSO, cache_path: &Path, hacks: &dyn Hacks, no_progress: bool) -> anyhow::Result<References> {
+    let nso_module_id = nso.file.header.module_id.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+    let refs_path = cache_path.join(format!("{}.dat", nso_module_id));
+    if refs_path.exists() {
+        println!(" Loading cached references from {:?}", refs_path);
+        let references = rkyv::from_bytes::<References, rancor::Error>(&fs::read(&refs_path)?)?;
+        return Ok(references);
+    }
+    
+    fs::create_dir_all(&cache_path)?;
+    let references = get_references_from_nso(nso, hacks, no_progress)?;
+    let data = rkyv::to_bytes::<rancor::Error>(&references)?;
+    fs::write(&refs_path, data)?;
+    Ok(references)
+}
+
+fn get_references_from_nso(nso: &NSO, hacks: &dyn Hacks, no_progress: bool) -> anyhow::Result<References> {
+    let m = if no_progress { None } else {
+        println!(" Step 0: Collecting references...");
+        Some(MultiProgress::new())
+    };
+
+    nso.get_references(
+        hacks,
+        m,
+    )
 }

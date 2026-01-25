@@ -7,7 +7,7 @@ mod objdiff;
 use crate::nso::{nso::NSO, nso_file::NsoFile};
 
 use argh::{FromArgValue, FromArgs};
-use std::fs::File;
+use std::{cell::LazyCell, fs::File};
 
 enum Game {
     SMO,
@@ -69,22 +69,27 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    let references = LazyCell::new(|| {
+        reference_tracker::get_references(&nso, std::path::Path::new("out/refs"), hacks.as_ref().expect("Hacks not found"), args.no_progress).unwrap_or_else(|e| {
+            panic!("Failed to get references: {}", e);
+        })
+    });
 
     if args.export_all {
         println!("Exporting all segments to 'out/asm' directory...");
-        nso.export_all(std::path::Path::new("out/asm"), hacks.as_ref().expect("Hacks not found"), args.no_progress)?;
+        nso.export_all(std::path::Path::new("out/asm"), hacks.as_ref().expect("Hacks not found"), &references, args.no_progress)?;
         println!("Done.");
     }
 
     if args.export_relinkable {
         println!("Exporting relinkable segments to 'out/asm' directory...");
-        nso.export_relinkable(std::path::Path::new("out/asm"), hacks.as_ref().expect("Hacks not found"), args.no_progress)?;
+        nso.export_relinkable(std::path::Path::new("out/asm"), hacks.as_ref().expect("Hacks not found"), &references, args.no_progress)?;
         println!("Done.");
     }
 
     if args.split {
         println!("Splitting NSO file...");
-        nso.split(hacks.as_ref().expect("Hacks not found"), file_list.as_ref().expect("File list not found"), std::path::Path::new("out/split"), args.no_progress)?;
+        nso.split(hacks.as_ref().expect("Hacks not found"), file_list.as_ref().expect("File list not found"), std::path::Path::new("out/split"), &references, args.no_progress)?;
         println!("Done.");
     }
 

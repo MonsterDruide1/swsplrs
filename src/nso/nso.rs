@@ -228,13 +228,12 @@ impl NSO {
         })
     }
 
-    pub fn export_all(&self, path: &Path, hacks: &dyn Hacks, no_progress: bool) -> anyhow::Result<()> {
+    pub fn export_all(&self, path: &Path, hacks: &dyn Hacks, references: &References, no_progress: bool) -> anyhow::Result<()> {
         let m = if no_progress { None } else {
             println!(" Step 1 / 2: Collecting references...");
             Some(MultiProgress::new())
         };
 
-        let references = self.get_references(hacks, m)?;
         let helper = NsoLookupHelper::new(self)?;
         fs::create_dir_all(path)?;
 
@@ -275,13 +274,12 @@ impl NSO {
         Ok(())
     }
 
-    pub fn export_relinkable(&self, path: &Path, hacks: &dyn Hacks, no_progress: bool) -> anyhow::Result<()> {
+    pub fn export_relinkable(&self, path: &Path, hacks: &dyn Hacks, references: &References, no_progress: bool) -> anyhow::Result<()> {
         let m = if no_progress { None } else {
             println!(" Step 1 / 2: Collecting references...");
             Some(MultiProgress::new())
         };
 
-        let references = self.get_references(hacks, m)?;
         let helper = NsoLookupHelper::new(self)?;
         fs::create_dir_all(path)?;
 
@@ -310,13 +308,7 @@ impl NSO {
         Ok(())
     }
 
-    pub fn split(&self, hacks: &dyn Hacks, file_list: &Vec<(String, Object)>, path: &Path, no_progress: bool) -> anyhow::Result<()> {
-        let m = if no_progress { None } else {
-            println!(" Step 1 / 3: Collecting references...");
-            Some(MultiProgress::new())
-        };
-
-        let references = self.get_references(hacks, m)?;
+    pub fn split(&self, hacks: &dyn Hacks, file_list: &Vec<(String, Object)>, path: &Path, references: &References, no_progress: bool) -> anyhow::Result<()> {
         let helper = NsoLookupHelper::new(self)?;
         fs::create_dir_all(path)?;
 
@@ -626,7 +618,7 @@ impl NSO {
         Ok(strings)
     }
 
-    fn get_references(&self, hacks: &dyn Hacks, m: Option<MultiProgress>) -> anyhow::Result<References> {
+    pub fn get_references(&self, hacks: &dyn Hacks, m: Option<MultiProgress>) -> anyhow::Result<References> {
         let mut reference_tracker = ReferenceTracker::new();
 
         let function_symbols: HashSet<u64> = self.symbol_table.1.iter()
