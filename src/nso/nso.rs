@@ -1091,10 +1091,7 @@ impl NSO {
                 writeln!(file, ".align {}", alignment)?;
             }
         }
-        for symbol in self.get_all_symbols(start + section_offset, helper) {
-            writeln!(file, ".global {}", symbol)?;
-            writeln!(file, "{}:", symbol)?;
-        }
+        self.export_symbols_force(start + section_offset, file, helper)?;
         
         while cursor.position() < end {
             self.export_data_entry(file, cursor, section_offset, references, helper)?;

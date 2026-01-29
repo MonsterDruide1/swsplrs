@@ -23,7 +23,7 @@ missingfunctions:
 	$(clang) -c -o obj/missingfunctions.o ../assets/missingfunctions.cpp
 assemble:
 	mkdir -p obj
-	bash -c 'for f in asm/*.s; do $(clang) -c -o "obj/$$(basename "$${f%.s}.o")" "$$f"; done'
+	cat asm/*.s | $(clang) -x assembler -c -o obj/assembled.o -
 link:
 	$(lld) -o myprog obj/*.o -T ../assets/ldscript.lcf -L. -lsdk -lsubsdk0 --warn-unresolved-symbols -pie --hash-style=both --dynamic-list=asm/exported_symbols.sym --eh-frame-hdr 2>&1 | sed '/warning: undefined symbol: glslc/,+2d'
 	cargo run --manifest-path ~/elf2nso/Cargo.toml myprog -o myprog.un.nso --build-id 3CA12DFAAF9C82DA064D1698DF79CDA100000000000000000000000000000000
