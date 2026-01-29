@@ -416,7 +416,7 @@ impl NSO {
         } else {
             "off"
         };
-        format!("{}_{:X}", prefix, address)
+        format!(".L{}_{:X}", prefix, address)
     }
 
     pub fn get_any_symbol(&self, address: u64, helper: &NsoLookupHelper) -> Result<String> {
@@ -791,7 +791,7 @@ impl NSO {
                 writeln!(file, ".global {}", self.get_fallback_symbol(address))?;
                 writeln!(file, "{}:", self.get_fallback_symbol(address))?;
             } else {
-                writeln!(file, ".L{}:", self.get_fallback_symbol(address))?;
+                writeln!(file, "{}:", self.get_fallback_symbol(address))?;
             }
             return Ok(());
         }
