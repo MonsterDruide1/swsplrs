@@ -1403,7 +1403,7 @@ impl NSO {
             Embed,
         }
 
-        refs.sort_by_cached_key(|(_, t)| *t);
+        refs.sort_by_cached_key(|(s, _)| *s);
 
         let mut chunks = HashMap::new();
         let rodata_subsections = hacks.get_rodata_subsections();
