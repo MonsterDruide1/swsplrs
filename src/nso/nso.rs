@@ -1479,16 +1479,6 @@ impl NSO {
             String::from_utf8_lossy(&output.stdout)
         );
         
-        let mut cmd = Command::new("aarch64-linux-gnu-strip");
-        cmd.arg("-x");
-        cmd.arg(output_path);
-        let output = cmd.output()?;
-        ensure!(output.status.success(), 
-            "Failed to strip {}: {}\n{}",
-            output_path.display(),
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout)
-        );
         Ok(())
     }
 }
