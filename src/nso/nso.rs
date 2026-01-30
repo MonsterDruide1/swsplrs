@@ -808,6 +808,9 @@ impl NSO {
                 }
                 _ => unreachable!("Unsupported symbol binding: {:?}", symbol.get_bind()?),
             }
+            if symbol.size > 0 {
+                writeln!(file, ".size {}, {}", name, symbol.size)?;
+            }
             writeln!(file, "{}:", name)?;
         }
         Ok(())
