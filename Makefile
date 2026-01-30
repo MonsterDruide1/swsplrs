@@ -1,11 +1,11 @@
 setup: data/file_list.yml data/main.nso data/sdk data/subsdk0 data/nx2elf data/clang data/ld.lld out
 
 relink: setup out/Makefile out/libsdk.so out/libsubsdk0.so out/libglslc.so
-	cargo run -- --export-relinkable --game SMO data/main.nso
+	cargo run --release -- --export-relinkable --game SMO data/main.nso
 	cd out && make assemble link
 
 objdiff: setup
-	cargo run -- --split --objdiff --game SMO data/main.nso
+	cargo run --release -- --split --objdiff --game SMO data/main.nso
 
 clean:
 	rm -r out || true
