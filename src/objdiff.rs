@@ -10,7 +10,7 @@ pub fn write_config(path: PathBuf, file_list: &Vec<(String, Object)>, hacks: &dy
         let path = hacks.get_object_path(name);
         let mappings = obj.text_section.iter()
                 .filter(|s| s.guess)
-                .map(|s| (format!("loc_{:X}", s.offset), s.name().to_string()))
+                .map(|s| (format!(".Lloc_{:X}", s.offset), s.name().to_string()))
                 .collect();
         ProjectObject {
             name: Some(path.clone()),
