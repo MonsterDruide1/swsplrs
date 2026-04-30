@@ -10,7 +10,7 @@ use crate::{
     file_list::Object, hacks::hacks::Hacks,
     nso::{eh_frame::EhFrame, nso_file::NsoFile, nso_header::{NsoHeader, NsoSegment}, section_map::{SectionMap, SectionType}, text::TextSection},
     reference_tracker::{DataRefType, ReferenceSource, ReferenceTracker, References},
-    utils::call_with_progress
+    util::utils::call_with_progress
 };
 
 pub struct NSO {

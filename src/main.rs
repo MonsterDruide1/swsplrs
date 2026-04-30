@@ -1,13 +1,13 @@
 mod nso;
 mod hacks;
-mod reference_tracker;
-mod file_list;
-mod utils;
-mod objdiff;
+mod util;
+mod export;
 use crate::nso::{nso::NSO, nso_file::NsoFile};
 
 use argh::{FromArgValue, FromArgs};
 use std::{cell::LazyCell, fs::File};
+use export::objdiff;
+use util::{file_list, reference_tracker};
 
 enum Game {
     SMO,
